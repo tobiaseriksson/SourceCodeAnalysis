@@ -345,6 +345,11 @@ def _get_lang(ext: str) -> str:
 #   Note: \bif\s*\( already matches the 'if' inside 'else if',
 #   so 'else if' must NOT be listed separately (would double-count).
 #
+#   Language-specific CC notes:
+#   - Python: `if` in `x if cond else y` is not a separate decision; ternary is one pattern.
+#   - Rust: each `=>` arm in match counts (like C switch `case`), not the `match` keyword.
+#   - Go: `for { ... }` (no parentheses) is counted as a loop decision.
+#
 # Cognitive Complexity (SonarSource, 2023):
 #   Four increment categories (per the official white paper):
 #
@@ -360,6 +365,7 @@ def _get_lang(ext: str) -> str:
 #     Logical operator SEQUENCES (not per-occurrence):
 #       a && b && c  →  +1  (one sequence of &&)
 #       a && b || c  →  +2  (one && seq, one || seq)
+#     Python `and`/`or` and Ruby `and`/`or` (merged with &&/|| in Ruby) follow the same rule.
 #     goto, break-to-label, continue-to-label
 #     Recursion (requires call-graph — not implemented here)
 #
@@ -444,18 +450,20 @@ _COG_HYBRID_C_EXTRA = []
 # Go uses 'select' for channel operations and 'range' in for loops
 _CC_GO_EXTRA = [
     re.compile(r"\bselect\s*\{"),
+    re.compile(r"\bfor\s*\{"),  # for { } without C-style (...)
 ]
 _COG_STRUCT_GO_EXTRA = [
     re.compile(r"\bselect\s*\{"),
+    re.compile(r"\bfor\s*\{"),
 ]
 # Go uses 'else if' like C-style
 _COG_HYBRID_GO_EXTRA = []
 
 # ── Rust extras ────────────────────────────────────────────────────────────
-# Rust uses match (similar to switch), loop, and if let
+# Rust: count each match arm (=>) like C switch counts each case; not match keyword
 _CC_RUST_EXTRA = [
     re.compile(r"\bloop\s*\{"),
-    re.compile(r"\bmatch\b"),
+    re.compile(r"=>"),
     re.compile(r"\bif\s+let\b"),
 ]
 _COG_STRUCT_RUST_EXTRA = [
@@ -515,14 +523,15 @@ _COG_HYBRID_SCALA_EXTRA = []
 # ── Python extras ──────────────────────────────────────────────────────────
 # Python uses indentation, not braces, so CC patterns are different
 _CC_PYTHON = [
-    re.compile(r"\bif\b"),
+    # Statement if — exclude middle `if` in `x if cond else y` (ternary counted below)
+    re.compile(r"\bif\b(?!\s+.+\s+else)"),
     re.compile(r"\belif\b"),
     re.compile(r"\bwhile\b"),
     re.compile(r"\bfor\b"),
     re.compile(r"\bexcept\b"),
     re.compile(r"\band\b"),
     re.compile(r"\bor\b"),
-    re.compile(r"\bif\s+.+\s+else\b"),  # ternary
+    re.compile(r"\bif\s+.+\s+else\b"),  # conditional expression (ternary)
 ]
 _COG_STRUCT_PYTHON = [
     re.compile(r"(?<!\bel)\bif\b(?!\s+.+\s+else)"),  # standalone if (not elif, not ternary)
@@ -614,6 +623,20 @@ def _patterns_for(lang: str):
 # Regex helpers for logical operator sequence detection (Fundamental increments)
 _RE_LOGICAL_AND = re.compile(r"&&")
 _RE_LOGICAL_OR = re.compile(r"\|\|")
+_RE_PY_KW_AND = re.compile(r"\band\b")
+_RE_PY_KW_OR = re.compile(r"\bor\b")
+
+
+def _count_operator_sequence_changes(ops: list) -> int:
+    """ops: list of (position, kind); +1 per contiguous run of same kind, +1 when kind changes."""
+    if not ops:
+        return 0
+    ops.sort(key=lambda x: x[0])
+    sequences = 1
+    for i in range(1, len(ops)):
+        if ops[i][1] != ops[i - 1][1]:
+            sequences += 1
+    return sequences
 
 
 def _count_logical_operator_sequences(stripped: str) -> int:
@@ -631,26 +654,36 @@ def _count_logical_operator_sequences(stripped: str) -> int:
       a && b || c && d    →  3  (&&, ||, &&)
       a || b && c || d    →  3  (||, &&, ||)
     """
-    # Find all && and || with their positions
     ops = []
     for m in _RE_LOGICAL_AND.finditer(stripped):
         ops.append((m.start(), "&&"))
     for m in _RE_LOGICAL_OR.finditer(stripped):
         ops.append((m.start(), "||"))
+    return _count_operator_sequence_changes(ops)
 
-    if not ops:
-        return 0
 
-    # Sort by position in the line
-    ops.sort(key=lambda x: x[0])
+def _count_python_keyword_logical_sequences(stripped: str) -> int:
+    """Fundamental increments for Python `and` / `or` (same sequence rules as && / ||)."""
+    ops = []
+    for m in _RE_PY_KW_AND.finditer(stripped):
+        ops.append((m.start(), "and"))
+    for m in _RE_PY_KW_OR.finditer(stripped):
+        ops.append((m.start(), "or"))
+    return _count_operator_sequence_changes(ops)
 
-    # Count sequences: +1 for first operator, +1 for each change of type
-    sequences = 1  # first operator always starts a sequence
-    for i in range(1, len(ops)):
-        if ops[i][1] != ops[i - 1][1]:
-            sequences += 1  # operator type changed → new sequence
 
-    return sequences
+def _count_ruby_logical_sequences(stripped: str) -> int:
+    """Ruby: merge &&, ||, and keyword `and` / `or` by source order."""
+    ops = []
+    for m in _RE_LOGICAL_AND.finditer(stripped):
+        ops.append((m.start(), "&&"))
+    for m in _RE_LOGICAL_OR.finditer(stripped):
+        ops.append((m.start(), "||"))
+    for m in _RE_PY_KW_AND.finditer(stripped):
+        ops.append((m.start(), "and"))
+    for m in _RE_PY_KW_OR.finditer(stripped):
+        ops.append((m.start(), "or"))
+    return _count_operator_sequence_changes(ops)
 
 
 _RE_TRY = re.compile(r"\btry\s*\{")
@@ -869,10 +902,11 @@ def _analyze_indentation_based(content: str, fm: FileMetrics) -> FileMetrics:
         for pattern in cog_hybrid_pats:
             fm.cognitive += len(pattern.findall(stripped))
 
-        # Logical operator sequences for Python/Ruby
-        if fm.lang in ("py", "ruby"):
-            # Python uses 'and'/'or', Ruby uses &&/||
-            fm.cognitive += _count_logical_operator_sequences(stripped)
+        # Fundamental: logical operator sequences (Python/Ruby keywords vs C-style &&/||)
+        if fm.lang == "py":
+            fm.cognitive += _count_python_keyword_logical_sequences(stripped)
+        elif fm.lang == "ruby":
+            fm.cognitive += _count_ruby_logical_sequences(stripped)
 
     return fm
 

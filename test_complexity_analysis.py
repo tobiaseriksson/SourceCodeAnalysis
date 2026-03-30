@@ -61,8 +61,11 @@ How to run:
     Integration — all three metrics at once (6 tests):
       TestIntegration
 
+    Python indentation analyzer & Go/Rust extras (6 tests):
+      TestPythonIndentationMetrics, TestGoRustCyclomaticExtras
+
   Expected output (all tests passing):
-    Ran 83 tests in 0.002s
+    Ran 88 tests in 0.002s
     OK
 """
 
@@ -71,6 +74,7 @@ import unittest
 from complexity_analysis import (
     FileMetrics,
     _analyze_cstyle,
+    _analyze_indentation_based,
     _count_logical_operator_sequences,
 )
 
@@ -81,6 +85,13 @@ def analyze(code: str, lang: str = "cs"):
     """Analyze a code snippet and return (cyclomatic, cognitive, max_nesting)."""
     fm = FileMetrics("__test__", lang)
     fm = _analyze_cstyle(code, fm)
+    return fm.cyclomatic, fm.cognitive, fm.max_nesting
+
+
+def analyze_py(code: str):
+    """Python / Ruby / R via indentation-based analyzer."""
+    fm = FileMetrics("__test__", "py")
+    fm = _analyze_indentation_based(code, fm)
     return fm.cyclomatic, fm.cognitive, fm.max_nesting
 
 
@@ -731,6 +742,55 @@ class TestIntegration(unittest.TestCase):
         # Cog: if(+1) + else-if(+1) + else-if(+1) + else-if(+1) + else(+1) = 5
         self.assertEqual(cog, 5)
         self.assertEqual(nest, 1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PYTHON INDENTATION ANALYZER + GO/RUST EXTRA PATTERNS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPythonIndentationMetrics(unittest.TestCase):
+    """Regression tests for Python-only CC/cognitive fixes (ternary + and/or sequences)."""
+
+    def test_conditional_expression_single_decision(self):
+        """`x if cond else y` must count as one decision (not if + ternary)."""
+        cc, cog, _ = analyze_py("x = a if cond else b\n")
+        self.assertEqual(cc, 2, "base 1 + one ternary expression")
+        self.assertEqual(cog, 0)
+
+    def test_if_and_chain_cognitive_matches_sequence_rule(self):
+        """if + one `and` sequence → cognitive 2 (structural + fundamental)."""
+        cc, cog, _ = analyze_py("if a and b and c:\n    x = 1\n")
+        self.assertEqual(cc, 4, "base + if + 2× and")
+        self.assertEqual(cog, 2)
+
+    def test_if_and_or_two_sequences(self):
+        _, cog, _ = analyze_py("if a and b or c:\n    pass\n")
+        self.assertEqual(cog, 3, "if + and-seq + or-seq")
+
+
+class TestGoRustCyclomaticExtras(unittest.TestCase):
+    """Go `for { }` and Rust `match` arms (=>) cyclomatic coverage."""
+
+    def test_go_infinite_for_loop(self):
+        cc, _, _ = analyze(
+            "package main\nfunc f() {\n  for {\n    break\n  }\n}\n",
+            lang="go",
+        )
+        self.assertEqual(cc, 2, "base 1 + for {")
+
+    def test_rust_match_counts_each_arm(self):
+        code = (
+            "fn f(x: i32) {\n"
+            "  match x {\n"
+            "    1 => a(),\n"
+            "    2 => b(),\n"
+            "    _ => c(),\n"
+            "  }\n"
+            "}\n"
+        )
+        cc, _, _ = analyze(code, lang="rust")
+        self.assertEqual(cc, 4, "base 1 + three => arms (like switch cases)")
 
 
 # ─── Run ────────────────────────────────────────────────────────────────────
