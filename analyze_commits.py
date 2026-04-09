@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
-"""Analyze commit-history.txt to extract statistics.
+"""Analyze git commit history (live `git log` or a pre-exported log file).
 
 Usage:
-    python3 analyze_commits.py [path_to_commit_history]
+    python3 analyze_commits.py [PATH]
 
-If no path is given, defaults to 'commit-history.txt' in the current directory.
+    PATH — root directory of the Git repository to analyze (default: current directory).
+           Ignored when --commit-history is used (except for resolving relative paths).
+
+    python3 analyze_commits.py /path/to/repo
+    python3 analyze_commits.py --commit-history commit-export.txt
+    python3 analyze_commits.py ./myrepo --exclude vendor/ node_modules/
+
+    python3 analyze_commits.py --export-commit-history
+    python3 analyze_commits.py /path/to/repo -E my-export.txt
+
+If --commit-history is omitted, history is fetched with `git log --numstat` in PATH.
+Use --export-commit-history (-E) to save that log to commit-history.txt (or a given file).
 """
 
+import os
 import re
 import json
 import argparse
@@ -16,16 +28,59 @@ from collections import Counter, defaultdict
 import subprocess
 import sys
 
-def parse_commit_history(exclude_paths=None):
-    """Fetch git log implicitly via subprocess and extract structured data using numstat."""
-    
-    print("Fetching git history natively (this takes a few seconds)...")
-    try:
-        content = subprocess.run(['git', 'log', '--numstat', '--no-merges'], 
-                                 stdout=subprocess.PIPE, text=True, check=True).stdout
-    except subprocess.CalledProcessError as e:
-        print(f"Error calling git: {e}")
-        sys.exit(1)
+
+def parse_commit_history(
+    exclude_paths=None,
+    repo_path=".",
+    commit_history_file=None,
+    export_commit_history_to=None,
+):
+    """Load `git log --numstat` output from a file or by running git in ``repo_path``.
+
+    When history is fetched from git and ``export_commit_history_to`` is set, the
+    same log text is written to that path before parsing.
+    """
+
+    if commit_history_file:
+        path = os.path.abspath(commit_history_file)
+        print(f"Reading commit history from {path} ...")
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError as e:
+            print(f"Error reading commit history file: {e}")
+            sys.exit(1)
+    else:
+        root = os.path.abspath(repo_path)
+        if not os.path.isdir(os.path.join(root, ".git")) and not os.path.isfile(
+            os.path.join(root, ".git")
+        ):
+            print(
+                f"Warning: {root!r} does not look like a Git working tree "
+                "(no .git). Continuing anyway.\n"
+            )
+        print(f"Fetching git history in {root} (this takes a few seconds)...")
+        try:
+            content = subprocess.run(
+                ["git", "log", "--numstat", "--no-merges"],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                text=True,
+                check=True,
+            ).stdout
+        except subprocess.CalledProcessError as e:
+            print(f"Error calling git: {e}")
+            sys.exit(1)
+
+        if export_commit_history_to:
+            out_path = os.path.abspath(export_commit_history_to)
+            try:
+                with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(content)
+            except OSError as e:
+                print(f"Error writing commit history export: {e}", file=sys.stderr)
+                sys.exit(1)
+            print(f"Wrote commit history export to {out_path}")
 
     file_commits = defaultdict(set)   # file -> set of commit hashes
     commit_messages = {}              # commit_hash -> message
@@ -218,16 +273,62 @@ def categorize_commit(message):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze git repository commit history natively.")
-    parser.add_argument("--exclude", nargs="*", default=[], help="Paths or prefixes to exclude (e.g. frontend/src/lib)")
+    parser = argparse.ArgumentParser(
+        description="Analyze git repository commit history (live git log or a saved export)."
+    )
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default=".",
+        help="Git repository root to analyze (default: current directory). Used as cwd for git log.",
+    )
+    parser.add_argument(
+        "--commit-history",
+        "-H",
+        metavar="FILE",
+        default=None,
+        help=(
+            "Read history from FILE (same format as `git log --numstat --no-merges`) "
+            "instead of running git."
+        ),
+    )
+    parser.add_argument(
+        "--export-commit-history",
+        "-E",
+        nargs="?",
+        const="commit-history.txt",
+        default=None,
+        metavar="FILE",
+        help=(
+            "After fetching from git, write the log to FILE (default: commit-history.txt). "
+            "Cannot be used with --commit-history."
+        ),
+    )
+    parser.add_argument(
+        "--exclude",
+        nargs="*",
+        default=[],
+        help="Paths or prefixes to exclude (e.g. frontend/src/lib)",
+    )
     args = parser.parse_args()
+
+    if args.commit_history and args.export_commit_history:
+        parser.error(
+            "--export-commit-history cannot be used with --commit-history "
+            "(use git in PATH to produce an export)."
+        )
 
     if args.exclude:
         print(f"Excluding paths starting with: {', '.join(args.exclude)}")
-        
+
     (file_commit_counts, author_commits, commit_messages, commit_dates, commit_authors, file_commits,
      file_additions, file_deletions, commit_additions, commit_deletions) = (
-        parse_commit_history(exclude_paths=args.exclude)
+        parse_commit_history(
+            exclude_paths=args.exclude,
+            repo_path=args.path,
+            commit_history_file=args.commit_history,
+            export_commit_history_to=args.export_commit_history,
+        )
     )
 
     total_unique_commits = len(commit_messages)
