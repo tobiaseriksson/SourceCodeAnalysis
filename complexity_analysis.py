@@ -158,10 +158,48 @@ LANG_CSTYLE = (LANG_JS | LANG_CSHARP | LANG_JAVA | LANG_C | LANG_CPP |
                LANG_GO | LANG_RUST | LANG_KOTLIN | LANG_SWIFT | LANG_DART |
                LANG_SCALA | LANG_PHP)
 
-# Thresholds
-CC_LOW = 5
-CC_MODERATE = 15
-CC_HIGH = 30
+# Thresholds for *per-file* aggregate scores (whole-file CC/Cog sums).
+#
+# Cyclomatic (McCabe): widely used risk bands from the SEI / C4 Software Technology
+# Reference Guide (Carnegie Mellon), summarized e.g. in JetBrains ReSharper cyclomatic
+# plugin docs: 1–10 low, 11–20 moderate, 21–50 high. Above 50 is “very high risk” in that
+# table; we split the tail into very high (51–100) and extreme (>100). The 100 boundary
+# is a round second tier (double the “high” band width) used in many tooling reports.
+# SonarQube S1541 defaults to 10 per method.
+CC_LOW = 10
+CC_MODERATE = 20
+CC_HIGH = 50
+CC_VERY_HIGH = 100
+
+# Cognitive (SonarSource): rule S3776 defaults to threshold 15 *per method*; file totals
+# use the same low/moderate/high edges as cyclomatic where possible; 51–100 vs >100
+# mirrors the CC split for the upper tail.
+COG_LOW = 15
+COG_MODERATE = 25
+COG_HIGH = 50
+COG_VERY_HIGH = 100
+
+# Max nesting depth (per file): brace / block depth reported by the analyzer.
+# ESLint max-depth defaults to 4; Sonar S134-style rules flag deep control flow.
+# Bands: shallow (0–2), near cap (3–4), deeper (5–6), very deep (7–9), extreme (10+).
+NEST_LOW = 2
+NEST_MODERATE = 4
+NEST_HIGH = 6
+NEST_VERY_HIGH = 9
+
+# Functions per file (detected top-level units): no single industry standard; bands use
+# the same numeric edges as cyclomatic/cognitive for consistency. Rough intent: few
+# units per file (low), typical modules (moderate), crowded files (high), very large
+# modules (very high), “god files” (extreme).
+FN_LOW = 10
+FN_MODERATE = 25
+FN_HIGH = 50
+FN_VERY_HIGH = 100
+
+
+def _metrics_excluding_markup(metrics: list) -> list:
+    """HTML, CSHTML, and Razor share lang 'html'; omit from code-complexity summaries."""
+    return [m for m in metrics if m.lang != "html"]
 
 
 # ─── Data classes ───────────────────────────────────────────────────────────
@@ -1277,49 +1315,55 @@ def health_score(metrics: list) -> float:
     if not metrics:
         return 5.0
 
-    n = len(metrics)
+    cm = _metrics_excluding_markup(metrics)
+    n = len(cm)
     total_code = sum(m.code_lines for m in metrics)
     total_comments = sum(m.comment_lines for m in metrics)
-    avg_cc = sum(m.cyclomatic for m in metrics) / n
-    avg_cog = sum(m.cognitive for m in metrics) / n
-    max_nest = max(m.max_nesting for m in metrics)
     comment_ratio = (total_comments / total_code * 100) if total_code else 0
-    very_high = sum(1 for m in metrics if m.cyclomatic > CC_HIGH)
 
     score = 5.0
 
-    # Cyclomatic average penalty
-    if avg_cc > 20:
-        score -= 1.5
-    elif avg_cc > 10:
-        score -= 0.75
-    elif avg_cc > 5:
-        score -= 0.25
+    if n:
+        avg_cc = sum(m.cyclomatic for m in cm) / n
+        avg_cog = sum(m.cognitive for m in cm) / n
+        max_nest = max(m.max_nesting for m in cm)
+        very_high = sum(1 for m in cm if m.cyclomatic > CC_HIGH)
+        extreme_cc = sum(1 for m in cm if m.cyclomatic > CC_VERY_HIGH)
 
-    # Cognitive average penalty
-    if avg_cog > 30:
-        score -= 1.5
-    elif avg_cog > 15:
-        score -= 0.75
-    elif avg_cog > 8:
-        score -= 0.25
+        # Cyclomatic average penalty
+        if avg_cc > 20:
+            score -= 1.5
+        elif avg_cc > 10:
+            score -= 0.75
+        elif avg_cc > 5:
+            score -= 0.25
 
-    # Comment ratio penalty
+        # Cognitive average penalty
+        if avg_cog > 30:
+            score -= 1.5
+        elif avg_cog > 15:
+            score -= 0.75
+        elif avg_cog > 8:
+            score -= 0.25
+
+        # Proportion of very-high files (CC > 50); extra weight if any extreme (CC > 100)
+        if very_high > n * 0.1:
+            score -= 0.5
+        elif very_high > n * 0.05:
+            score -= 0.25
+        if extreme_cc > 0 and extreme_cc >= max(1, n * 0.02):
+            score -= 0.25
+
+        # Nesting penalty (aligns with NEST_HIGH / NEST_VERY_HIGH bands)
+        if max_nest > NEST_VERY_HIGH:
+            score -= 0.5
+        elif max_nest > NEST_HIGH:
+            score -= 0.25
+
+    # Comment ratio penalty (whole project, including markup)
     if comment_ratio < 2:
         score -= 0.5
     elif comment_ratio < 5:
-        score -= 0.25
-
-    # Proportion of very-high files
-    if very_high > n * 0.1:
-        score -= 0.5
-    elif very_high > n * 0.05:
-        score -= 0.25
-
-    # Nesting penalty
-    if max_nest > 8:
-        score -= 0.5
-    elif max_nest > 6:
         score -= 0.25
 
     return max(1.0, min(5.0, round(score, 1)))
@@ -1334,27 +1378,49 @@ def print_summary(metrics: list, top_n: int = 10, verbose: bool = False):
         return
 
     n = len(metrics)
+    mcode = _metrics_excluding_markup(metrics)
+    ncode = len(mcode)
     total_lines = sum(m.total_lines for m in metrics)
     total_code = sum(m.code_lines for m in metrics)
     total_comments = sum(m.comment_lines for m in metrics)
     total_blank = sum(m.blank_lines for m in metrics)
-    total_cc = sum(m.cyclomatic for m in metrics)
-    total_cog = sum(m.cognitive for m in metrics)
+    total_cc = sum(m.cyclomatic for m in mcode)
+    total_cog = sum(m.cognitive for m in mcode)
     comment_ratio = (total_comments / total_code * 100) if total_code else 0
-    max_nest = max(m.max_nesting for m in metrics)
+    max_nest = max(m.max_nesting for m in mcode) if mcode else 0
 
-    cc_sorted = sorted(m.cyclomatic for m in metrics)
-    cog_sorted = sorted(m.cognitive for m in metrics)
-    median_cc = cc_sorted[n // 2]
-    median_cog = cog_sorted[n // 2]
+    cc_sorted = sorted(m.cyclomatic for m in mcode)
+    cog_sorted = sorted(m.cognitive for m in mcode)
+    median_cc = cc_sorted[ncode // 2] if ncode else 0
+    median_cog = cog_sorted[ncode // 2] if ncode else 0
 
     cats = categorize(metrics)
 
-    low = sum(1 for m in metrics if m.cyclomatic <= CC_LOW)
-    mod = sum(1 for m in metrics if CC_LOW < m.cyclomatic <= CC_MODERATE)
-    high = sum(1 for m in metrics if CC_MODERATE < m.cyclomatic <= CC_HIGH)
-    vhigh = sum(1 for m in metrics if m.cyclomatic > CC_HIGH)
-    deep = sum(1 for m in metrics if m.max_nesting >= 4)
+    low = sum(1 for m in mcode if m.cyclomatic <= CC_LOW)
+    mod = sum(1 for m in mcode if CC_LOW < m.cyclomatic <= CC_MODERATE)
+    high = sum(1 for m in mcode if CC_MODERATE < m.cyclomatic <= CC_HIGH)
+    vhigh = sum(1 for m in mcode if CC_HIGH < m.cyclomatic <= CC_VERY_HIGH)
+    cext = sum(1 for m in mcode if m.cyclomatic > CC_VERY_HIGH)
+    cog_low = sum(1 for m in mcode if m.cognitive <= COG_LOW)
+    cog_mod = sum(1 for m in mcode if COG_LOW < m.cognitive <= COG_MODERATE)
+    cog_high = sum(1 for m in mcode if COG_MODERATE < m.cognitive <= COG_HIGH)
+    cog_vhigh = sum(1 for m in mcode if COG_HIGH < m.cognitive <= COG_VERY_HIGH)
+    cog_ext = sum(1 for m in mcode if m.cognitive > COG_VERY_HIGH)
+    deep = sum(1 for m in mcode if m.max_nesting >= 4)
+    nest_sorted = sorted(m.max_nesting for m in mcode)
+    median_nest = nest_sorted[ncode // 2] if ncode else 0
+    nest_shallow = sum(1 for m in mcode if m.max_nesting <= NEST_LOW)
+    nest_mod = sum(1 for m in mcode if NEST_LOW < m.max_nesting <= NEST_MODERATE)
+    nest_high = sum(1 for m in mcode if NEST_MODERATE < m.max_nesting <= NEST_HIGH)
+    nest_vhigh = sum(1 for m in mcode if NEST_HIGH < m.max_nesting <= NEST_VERY_HIGH)
+    nest_ext = sum(1 for m in mcode if m.max_nesting > NEST_VERY_HIGH)
+    fn_sorted = sorted(m.functions for m in mcode)
+    median_fn = fn_sorted[ncode // 2] if ncode else 0
+    fn_low = sum(1 for m in mcode if m.functions <= FN_LOW)
+    fn_mod = sum(1 for m in mcode if FN_LOW < m.functions <= FN_MODERATE)
+    fn_high = sum(1 for m in mcode if FN_MODERATE < m.functions <= FN_HIGH)
+    fn_vhigh = sum(1 for m in mcode if FN_HIGH < m.functions <= FN_VERY_HIGH)
+    fn_ext = sum(1 for m in mcode if m.functions > FN_VERY_HIGH)
 
     score = health_score(metrics)
     stars = "★" * int(round(score)) + "☆" * (5 - int(round(score)))
@@ -1391,8 +1457,8 @@ def print_summary(metrics: list, top_n: int = 10, verbose: bool = False):
     print(f"    Markup (HTML):       {len(cats['markup'])}")
     print()
 
-    # Size
-    total_funcs = sum(m.functions for m in metrics)
+    # Size (function counts exclude markup; see FUNCTIONS section)
+    total_funcs = sum(m.functions for m in mcode)
 
     print("SIZE")
     print(f"  Total lines:           {total_lines:,}")
@@ -1401,32 +1467,71 @@ def print_summary(metrics: list, top_n: int = 10, verbose: bool = False):
     print(f"  Blank lines:           {total_blank:,}")
     print(f"  Comment ratio:         {comment_ratio:.1f}%")
     print(f"  Avg code lines/file:   {total_code / n:.0f}")
-    print(f"  Total functions:       {total_funcs:,}")
-    print(f"  Avg functions/file:    {total_funcs / n:.1f}")
+    print(f"  Total functions:       {total_funcs:,}  (excl. HTML/markup)")
+    avg_fn = total_funcs / ncode if ncode else 0.0
+    print(f"  Avg functions/file:    {avg_fn:.1f}  (non-markup files only)")
     print()
 
+    _pct = lambda c: (c / ncode * 100) if ncode else 0.0
+
     # Cyclomatic
-    print("CYCLOMATIC COMPLEXITY")
+    print("CYCLOMATIC COMPLEXITY  (excl. HTML/markup)")
     print(f"  Total:                 {total_cc:,}")
-    print(f"  Average / file:        {total_cc / n:.1f}")
+    print(f"  Average / file:        {total_cc / ncode:.1f}" if ncode else "  Average / file:        —")
     print(f"  Median / file:         {median_cc}")
-    print(f"    Low     (1–{CC_LOW}):       {low:>3} files  ({low / n * 100:.0f}%)")
-    print(f"    Moderate({CC_LOW + 1}–{CC_MODERATE}):    {mod:>3} files  ({mod / n * 100:.0f}%)")
-    print(f"    High    ({CC_MODERATE + 1}–{CC_HIGH}):   {high:>3} files  ({high / n * 100:.0f}%)")
-    print(f"    V. High (>{CC_HIGH}):      {vhigh:>3} files  ({vhigh / n * 100:.0f}%)")
+    print(f"    Low     (1–{CC_LOW}):       {low:>3} files  ({_pct(low):.0f}%)")
+    print(f"    Moderate({CC_LOW + 1}–{CC_MODERATE}):    {mod:>3} files  ({_pct(mod):.0f}%)")
+    print(f"    High    ({CC_MODERATE + 1}–{CC_HIGH}):   {high:>3} files  ({_pct(high):.0f}%)")
+    print(
+        f"    V. High ({CC_HIGH + 1}–{CC_VERY_HIGH}): {vhigh:>3} files  "
+        f"({_pct(vhigh):.0f}%)"
+    )
+    print(f"    Extreme (>{CC_VERY_HIGH}):   {cext:>3} files  ({_pct(cext):.0f}%)")
     print()
 
     # Cognitive
-    print("COGNITIVE COMPLEXITY")
+    print("COGNITIVE COMPLEXITY  (excl. HTML/markup)")
     print(f"  Total:                 {total_cog:,}")
-    print(f"  Average / file:        {total_cog / n:.1f}")
+    print(f"  Average / file:        {total_cog / ncode:.1f}" if ncode else "  Average / file:        —")
     print(f"  Median / file:         {median_cog}")
+    print(f"    Low     (0–{COG_LOW}):       {cog_low:>3} files  ({_pct(cog_low):.0f}%)")
+    print(f"    Moderate({COG_LOW + 1}–{COG_MODERATE}):    {cog_mod:>3} files  ({_pct(cog_mod):.0f}%)")
+    print(f"    High    ({COG_MODERATE + 1}–{COG_HIGH}):   {cog_high:>3} files  ({_pct(cog_high):.0f}%)")
+    print(
+        f"    V. High ({COG_HIGH + 1}–{COG_VERY_HIGH}): {cog_vhigh:>3} files  "
+        f"({_pct(cog_vhigh):.0f}%)"
+    )
+    print(f"    Extreme (>{COG_VERY_HIGH}):   {cog_ext:>3} files  ({_pct(cog_ext):.0f}%)")
     print()
 
     # Nesting
-    print("NESTING")
-    print(f"  Max depth:             {max_nest}")
-    print(f"  Files with depth ≥ 4:  {deep}")
+    print("NESTING (max block/brace depth per file, excl. HTML/markup)")
+    print(f"  Max depth (project):   {max_nest}")
+    print(f"  Median / file:         {median_nest}")
+    print(f"    Low     (0–{NEST_LOW}):       {nest_shallow:>3} files  ({_pct(nest_shallow):.0f}%)")
+    print(f"    Moderate({NEST_LOW + 1}–{NEST_MODERATE}):    {nest_mod:>3} files  ({_pct(nest_mod):.0f}%)")
+    print(f"    High    ({NEST_MODERATE + 1}–{NEST_HIGH}):   {nest_high:>3} files  ({_pct(nest_high):.0f}%)")
+    print(
+        f"    V. High ({NEST_HIGH + 1}–{NEST_VERY_HIGH}): {nest_vhigh:>3} files  "
+        f"({_pct(nest_vhigh):.0f}%)"
+    )
+    print(f"    Extreme (>{NEST_VERY_HIGH}):   {nest_ext:>3} files  ({_pct(nest_ext):.0f}%)")
+    print(f"  Files with depth ≥ 4:  {deep}  (common style / ESLint max-depth default)")
+    print()
+
+    # Functions per file
+    print("FUNCTIONS (count per file, excl. HTML/markup)")
+    print(f"  Total (project):       {total_funcs:,}")
+    print(f"  Average / file:        {avg_fn:.1f}" if ncode else "  Average / file:        —")
+    print(f"  Median / file:         {median_fn}")
+    print(f"    Low     (0–{FN_LOW}):       {fn_low:>3} files  ({_pct(fn_low):.0f}%)")
+    print(f"    Moderate({FN_LOW + 1}–{FN_MODERATE}):    {fn_mod:>3} files  ({_pct(fn_mod):.0f}%)")
+    print(f"    High    ({FN_MODERATE + 1}–{FN_HIGH}):   {fn_high:>3} files  ({_pct(fn_high):.0f}%)")
+    print(
+        f"    V. High ({FN_HIGH + 1}–{FN_VERY_HIGH}): {fn_vhigh:>3} files  "
+        f"({_pct(fn_vhigh):.0f}%)"
+    )
+    print(f"    Extreme (>{FN_VERY_HIGH}):   {fn_ext:>3} files  ({_pct(fn_ext):.0f}%)")
     print()
 
     # Business logic subset
@@ -1443,11 +1548,11 @@ def print_summary(metrics: list, top_n: int = 10, verbose: bool = False):
         print(f"  Avg Cognitive / file:  {biz_cog / biz_n:.1f}")
         print()
 
-    # Top hotspots
-    by_cc = sorted(metrics, key=lambda m: m.cyclomatic, reverse=True)
-    by_cog = sorted(metrics, key=lambda m: m.cognitive, reverse=True)
-    by_nest = sorted(metrics, key=lambda m: m.max_nesting, reverse=True)
-    by_funcs = sorted(metrics, key=lambda m: m.functions, reverse=True)
+    # Top hotspots (complexity tops omit markup; size uses all files)
+    by_cc = sorted(mcode, key=lambda m: m.cyclomatic, reverse=True)
+    by_cog = sorted(mcode, key=lambda m: m.cognitive, reverse=True)
+    by_nest = sorted(mcode, key=lambda m: m.max_nesting, reverse=True)
+    by_funcs = sorted(mcode, key=lambda m: m.functions, reverse=True)
     by_size = sorted(metrics, key=lambda m: m.code_lines, reverse=True)
 
     def _table(title, items, sort_key):
@@ -1463,9 +1568,9 @@ def print_summary(metrics: list, top_n: int = 10, verbose: bool = False):
     _table(f"TOP {top_n} — MOST FUNCTIONS", by_funcs, "functions")
     _table(f"TOP {top_n} — LARGEST FILES", by_size, "code_lines")
 
-    # ── Per-function top lists ──
+    # ── Per-function top lists ── (omit markup)
     all_funcs = []
-    for m in metrics:
+    for m in mcode:
         all_funcs.extend(m.function_metrics)
 
     if all_funcs:
@@ -1513,7 +1618,45 @@ def print_summary(metrics: list, top_n: int = 10, verbose: bool = False):
         print("  High complexity. Systematic refactoring is recommended.")
 
     if vhigh:
-        print(f"\n  {vhigh} file(s) exceed CC>{CC_HIGH} — prime refactoring candidates.")
+        print(
+            f"\n  {vhigh} file(s) in cyclomatic band "
+            f"{CC_HIGH + 1}–{CC_VERY_HIGH} — prioritize refactoring."
+        )
+    if cext:
+        print(
+            f"\n  {cext} file(s) exceed cyclomatic >{CC_VERY_HIGH} — "
+            "severe hotspots; break up or split files."
+        )
+    if cog_vhigh:
+        print(
+            f"\n  {cog_vhigh} file(s) in cognitive band "
+            f"{COG_HIGH + 1}–{COG_VERY_HIGH} (aggregate) — simplify control flow."
+        )
+    if cog_ext:
+        print(
+            f"\n  {cog_ext} file(s) exceed cognitive >{COG_VERY_HIGH} (aggregate) — "
+            "severe complexity; treat as refactor targets."
+        )
+    if nest_vhigh:
+        print(
+            f"\n  {nest_vhigh} file(s) with nesting depth "
+            f"{NEST_HIGH + 1}–{NEST_VERY_HIGH} — consider flattening or helpers."
+        )
+    if nest_ext:
+        print(
+            f"\n  {nest_ext} file(s) exceed nesting depth >{NEST_VERY_HIGH} — "
+            "pathological structure; flatten aggressively."
+        )
+    if fn_vhigh:
+        print(
+            f"\n  {fn_vhigh} file(s) have {FN_HIGH + 1}–{FN_VERY_HIGH} functions — "
+            "large modules; consider splitting."
+        )
+    if fn_ext:
+        print(
+            f"\n  {fn_ext} file(s) exceed {FN_VERY_HIGH} functions — "
+            "likely god files; split by responsibility."
+        )
 
     print()
 
@@ -1521,23 +1664,115 @@ def print_summary(metrics: list, top_n: int = 10, verbose: bool = False):
 def print_json(metrics: list):
     """Output metrics as JSON for tooling integration."""
     n = len(metrics)
+    mcode = _metrics_excluding_markup(metrics)
+    ncode = len(mcode)
     total_code = sum(m.code_lines for m in metrics)
     total_comments = sum(m.comment_lines for m in metrics)
 
     output = {
         "summary": {
             "files": n,
+            "files_in_complexity_summaries": ncode,
             "total_lines": sum(m.total_lines for m in metrics),
             "code_lines": total_code,
             "comment_lines": total_comments,
             "blank_lines": sum(m.blank_lines for m in metrics),
             "comment_ratio_pct": round(total_comments / total_code * 100, 1) if total_code else 0,
-            "cyclomatic_total": sum(m.cyclomatic for m in metrics),
-            "cyclomatic_avg": round(sum(m.cyclomatic for m in metrics) / n, 1) if n else 0,
-            "cognitive_total": sum(m.cognitive for m in metrics),
-            "cognitive_avg": round(sum(m.cognitive for m in metrics) / n, 1) if n else 0,
-            "max_nesting": max(m.max_nesting for m in metrics) if metrics else 0,
-            "total_functions": sum(m.functions for m in metrics),
+            "cyclomatic_total": sum(m.cyclomatic for m in mcode),
+            "cyclomatic_avg": round(sum(m.cyclomatic for m in mcode) / ncode, 1) if ncode else 0,
+            "cognitive_total": sum(m.cognitive for m in mcode),
+            "cognitive_avg": round(sum(m.cognitive for m in mcode) / ncode, 1) if ncode else 0,
+            "cyclomatic_distribution": {
+                "low_1_to_10": sum(1 for m in mcode if m.cyclomatic <= CC_LOW),
+                "moderate_11_to_20": sum(
+                    1 for m in mcode if CC_LOW < m.cyclomatic <= CC_MODERATE
+                ),
+                "high_21_to_50": sum(
+                    1 for m in mcode if CC_MODERATE < m.cyclomatic <= CC_HIGH
+                ),
+                "very_high_51_to_100": sum(
+                    1 for m in mcode if CC_HIGH < m.cyclomatic <= CC_VERY_HIGH
+                ),
+                "extreme_above_100": sum(1 for m in mcode if m.cyclomatic > CC_VERY_HIGH),
+                "thresholds": {
+                    "low_max": CC_LOW,
+                    "moderate_max": CC_MODERATE,
+                    "high_max": CC_HIGH,
+                    "very_high_max": CC_VERY_HIGH,
+                },
+                "reference": "SEI/C4 risk bands; excludes HTML/cshtml/razor",
+            },
+            "cognitive_distribution": {
+                "low_0_to_15": sum(1 for m in mcode if m.cognitive <= COG_LOW),
+                "moderate_16_to_25": sum(
+                    1 for m in mcode if COG_LOW < m.cognitive <= COG_MODERATE
+                ),
+                "high_26_to_50": sum(
+                    1 for m in mcode if COG_MODERATE < m.cognitive <= COG_HIGH
+                ),
+                "very_high_51_to_100": sum(
+                    1 for m in mcode if COG_HIGH < m.cognitive <= COG_VERY_HIGH
+                ),
+                "extreme_above_100": sum(1 for m in mcode if m.cognitive > COG_VERY_HIGH),
+                "thresholds": {
+                    "low_max": COG_LOW,
+                    "moderate_max": COG_MODERATE,
+                    "high_max": COG_HIGH,
+                    "very_high_max": COG_VERY_HIGH,
+                },
+                "reference": "Sonar S3776 default 15/method; excludes HTML/cshtml/razor",
+            },
+            "nesting_median": sorted(m.max_nesting for m in mcode)[ncode // 2] if mcode else 0,
+            "nesting_distribution": {
+                "low_0_to_2": sum(1 for m in mcode if m.max_nesting <= NEST_LOW),
+                "moderate_3_to_4": sum(
+                    1 for m in mcode if NEST_LOW < m.max_nesting <= NEST_MODERATE
+                ),
+                "high_5_to_6": sum(
+                    1 for m in mcode if NEST_MODERATE < m.max_nesting <= NEST_HIGH
+                ),
+                "very_high_7_to_9": sum(
+                    1 for m in mcode if NEST_HIGH < m.max_nesting <= NEST_VERY_HIGH
+                ),
+                "extreme_10_plus": sum(1 for m in mcode if m.max_nesting > NEST_VERY_HIGH),
+                "thresholds": {
+                    "low_max": NEST_LOW,
+                    "moderate_max": NEST_MODERATE,
+                    "high_max": NEST_HIGH,
+                    "very_high_max": NEST_VERY_HIGH,
+                },
+                "reference": "ESLint max-depth / Sonar S134-style; excludes HTML/cshtml/razor",
+            },
+            "max_nesting": max(m.max_nesting for m in mcode) if mcode else 0,
+            "total_functions": sum(m.functions for m in mcode),
+            "functions_avg_per_file": round(
+                sum(m.functions for m in mcode) / ncode, 1
+            )
+            if ncode
+            else 0,
+            "functions_median_per_file": sorted(m.functions for m in mcode)[ncode // 2]
+            if mcode
+            else 0,
+            "functions_per_file_distribution": {
+                "low_0_to_10": sum(1 for m in mcode if m.functions <= FN_LOW),
+                "moderate_11_to_25": sum(
+                    1 for m in mcode if FN_LOW < m.functions <= FN_MODERATE
+                ),
+                "high_26_to_50": sum(
+                    1 for m in mcode if FN_MODERATE < m.functions <= FN_HIGH
+                ),
+                "very_high_51_to_100": sum(
+                    1 for m in mcode if FN_HIGH < m.functions <= FN_VERY_HIGH
+                ),
+                "extreme_above_100": sum(1 for m in mcode if m.functions > FN_VERY_HIGH),
+                "thresholds": {
+                    "low_max": FN_LOW,
+                    "moderate_max": FN_MODERATE,
+                    "high_max": FN_HIGH,
+                    "very_high_max": FN_VERY_HIGH,
+                },
+                "reference": "Heuristic file-size bands; excludes HTML/cshtml/razor",
+            },
             "health_score": health_score(metrics),
         },
         "files": [m.to_dict() for m in sorted(metrics, key=lambda m: m.cyclomatic, reverse=True)],

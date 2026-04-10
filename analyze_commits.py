@@ -16,6 +16,10 @@ Usage:
 
 If --commit-history is omitted, history is fetched with `git log --numstat` in PATH.
 Use --export-commit-history (-E) to save that log to commit-history.txt (or a given file).
+
+By default, a "code age" table is printed: bucket granularity depends on repository age
+(< 6 months: ISO week; < 2 years: month; else years up to 24+), then top modules per bucket
+(--code-age-top-modules, default 5). Use --no-code-age to skip.
 """
 
 import os
@@ -23,6 +27,7 @@ import re
 import json
 import argparse
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 
 import subprocess
@@ -210,6 +215,294 @@ def extract_module(filepath):
     return '/'.join(parts[:-1])
 
 
+def parse_git_commit_date(date_str):
+    """Parse git `Date:` header value, e.g. 'Thu Mar 18 14:42:51 2021 +0100'."""
+    if not date_str:
+        return None
+    date_str = date_str.strip()
+    try:
+        return datetime.strptime(date_str, "%a %b %d %H:%M:%S %Y %z")
+    except ValueError:
+        pass
+    return None
+
+
+def parse_git_iso_date(date_str):
+    """Parse `git log --format=%cI` output, e.g. '2021-03-18T14:42:51+01:00'."""
+    if not date_str:
+        return None
+    date_str = date_str.strip()
+    if date_str.endswith("Z"):
+        try:
+            return (
+                datetime.strptime(date_str[:-1], "%Y-%m-%dT%H:%M:%S")
+                .replace(tzinfo=timezone.utc)
+            )
+        except ValueError:
+            return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _last_mod_datetime_for_file(repo_root, git_path, file_commits, commit_dates):
+    """Latest commit date touching ``git_path`` from parsed history, else `git log -1`."""
+    commits = file_commits.get(git_path)
+    best = None
+    if commits:
+        for c in commits:
+            ds = commit_dates.get(c)
+            if not ds:
+                continue
+            dt = parse_git_commit_date(ds)
+            if dt is not None and (best is None or dt > best):
+                best = dt
+    if best is not None:
+        return best
+    git_path_n = git_path.replace("\\", "/")
+    try:
+        r = subprocess.run(
+            ["git", "log", "-1", "--format=%cI", "--", git_path_n],
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return parse_git_iso_date(r.stdout.strip())
+    except OSError:
+        pass
+    return None
+
+
+def _line_count_at_head(repo_root, git_path):
+    """Line count of file at HEAD; 0 if missing, binary, or unreadable."""
+    git_path_n = git_path.replace("\\", "/")
+    try:
+        r = subprocess.run(
+            ["git", "show", f"HEAD:{git_path_n}"],
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if r.returncode != 0 or not r.stdout:
+            return 0
+        data = r.stdout
+        if b"\x00" in data[:65536]:
+            return 0
+        text = data.decode("utf-8", errors="replace")
+        if not text:
+            return 0
+        return len(text.splitlines())
+    except OSError:
+        return 0
+
+
+def _oldest_commit_datetime(commit_dates):
+    """Earliest commit timestamp in parsed history (for repository age)."""
+    best = None
+    for ds in commit_dates.values():
+        dt = parse_git_commit_date(ds)
+        if dt is None:
+            continue
+        if best is None or dt < best:
+            best = dt
+    return best
+
+
+def _code_age_grouping_mode(repo_span_days):
+    """Choose week / month / year buckets from repository span in days."""
+    if repo_span_days is None:
+        return "year"
+    if repo_span_days < 183:  # < ~6 months
+        return "week"
+    if repo_span_days < 730:  # < 2 years
+        return "month"
+    return "year"
+
+
+def _code_age_bucket_key(last_mod, now, mode):
+    """Hashable bucket key for last-modification time under the given mode."""
+    if last_mod.tzinfo is None:
+        last_mod = last_mod.replace(tzinfo=timezone.utc)
+    else:
+        last_mod = last_mod.astimezone(timezone.utc)
+
+    if mode == "week":
+        y, w, _ = last_mod.isocalendar()
+        return ("week", y, w)
+    if mode == "month":
+        return ("month", last_mod.year, last_mod.month)
+    # year: floor years since last change, cap at 24 (label 24+)
+    delta = now - last_mod
+    years = max(0.0, delta.total_seconds() / (365.25 * 24 * 3600.0))
+    b = min(int(years), 24)
+    return ("year", b)
+
+
+def _code_age_bucket_label(key):
+    """Human-readable label for a bucket key."""
+    kind = key[0]
+    if kind == "week":
+        _, y, w = key
+        return f"ISO week {y}-W{w:02d} (last change)"
+    if kind == "month":
+        _, y, m = key
+        return f"{y}-{m:02d} (last change)"
+    if kind == "year":
+        _, b = key
+        if b < 24:
+            return f"{b}–{b + 1} years since last change"
+        return "24+ years since last change"
+    return str(key)
+
+
+def _sort_code_age_bucket_keys(keys):
+    """Chronological order: oldest periods first."""
+
+    def sk(k):
+        if k[0] == "week":
+            return (0, k[1], k[2])
+        if k[0] == "month":
+            return (1, k[1], k[2])
+        if k[0] == "year":
+            return (2, k[1])
+        return (3, str(k))
+
+    return sorted(keys, key=sk)
+
+
+def compute_code_age_by_lines(
+    repo_root,
+    file_commits,
+    commit_dates,
+    exclude_paths,
+    top_modules_per_bucket=5,
+):
+    """Distribute current line counts at HEAD into age buckets.
+
+    Grouping depends on **repository age** (oldest commit in parsed history → now):
+
+    - **< ~6 months**: buckets by **ISO week** of last file change.
+    - **6 months … < 2 years**: buckets by **calendar month** of last file change.
+    - **≥ 2 years**: buckets by **years since last change**, from 0–1y … 23–24y, then **24+y**.
+
+    Approximation: all lines in a file inherit the **latest** commit date that touched
+    that file in the parsed (non-merge) history. This is not per-line `git blame`.
+
+    For each bucket, the top ``top_modules_per_bucket`` modules (directory path without
+    filename) by line count in that bucket are attached as ``top_modules``.
+
+    Returns dict with ``grouping_mode``, ``repo_span_days``, ``buckets`` (each with
+    ``label``, ``lines``, ``pct``, ``top_modules``), etc.
+    """
+    root = os.path.abspath(repo_root)
+    exclude_normalized = [ex.strip().lstrip("./") for ex in (exclude_paths or []) if ex.strip()]
+    now = datetime.now(timezone.utc)
+
+    oldest = _oldest_commit_datetime(commit_dates)
+    repo_span_days = None
+    oldest_iso = None
+    if oldest is not None:
+        o = oldest if oldest.tzinfo else oldest.replace(tzinfo=timezone.utc)
+        o = o.astimezone(timezone.utc)
+        oldest_iso = o.isoformat()
+        repo_span_days = (now - o).days
+
+    mode = _code_age_grouping_mode(repo_span_days)
+
+    try:
+        ls = subprocess.run(
+            ["git", "ls-files"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, OSError) as e:
+        return {
+            "error": str(e),
+            "total_lines": 0,
+            "buckets": [],
+            "unknown_lines": 0,
+            "grouping_mode": mode,
+            "repo_span_days": repo_span_days,
+        }
+
+    paths = [p.strip() for p in ls.stdout.splitlines() if p.strip()]
+    bucket_lines = Counter()
+    bucket_module_lines = defaultdict(Counter) if top_modules_per_bucket else None
+    unknown_lines = 0
+    total_lines = 0
+
+    for git_path in paths:
+        if any(git_path.startswith(ex) or git_path == ex.rstrip("/") for ex in exclude_normalized):
+            continue
+        lines = _line_count_at_head(root, git_path)
+        if lines <= 0:
+            continue
+        total_lines += lines
+        last_mod = _last_mod_datetime_for_file(root, git_path, file_commits, commit_dates)
+        if last_mod is None:
+            unknown_lines += lines
+            continue
+        key = _code_age_bucket_key(last_mod, now, mode)
+        bucket_lines[key] += lines
+        if bucket_module_lines is not None:
+            module = extract_module(git_path.replace("\\", "/"))
+            bucket_module_lines[key][module] += lines
+
+    sorted_keys = _sort_code_age_bucket_keys(bucket_lines.keys())
+    buckets = []
+    for key in sorted_keys:
+        ln = bucket_lines[key]
+        pct = (100.0 * ln / total_lines) if total_lines > 0 else 0.0
+        entry = {
+            "label": _code_age_bucket_label(key),
+            "lines": ln,
+            "pct": round(pct, 1),
+        }
+        if (
+            top_modules_per_bucket
+            and top_modules_per_bucket > 0
+            and ln > 0
+            and bucket_module_lines is not None
+        ):
+            mods = bucket_module_lines[key].most_common(top_modules_per_bucket)
+            entry["top_modules"] = [
+                {
+                    "module": name,
+                    "lines": mlines,
+                    "pct_of_bucket": round(100.0 * mlines / ln, 1) if ln else 0.0,
+                }
+                for name, mlines in mods
+            ]
+        else:
+            entry["top_modules"] = []
+        buckets.append(entry)
+
+    unk_pct = (100.0 * unknown_lines / total_lines) if total_lines > 0 else 0.0
+    return {
+        "total_lines": total_lines,
+        "unknown_lines": unknown_lines,
+        "unknown_pct": round(unk_pct, 1),
+        "buckets": buckets,
+        "reference_time_utc": now.isoformat(),
+        "grouping_mode": mode,
+        "repo_span_days": repo_span_days,
+        "oldest_commit_utc": oldest_iso,
+    }
+
+
 def categorize_commit(message):
     """Categorize a commit message into: bug_fix, feature, refactoring, or other.
 
@@ -309,6 +602,24 @@ def main():
         nargs="*",
         default=[],
         help="Paths or prefixes to exclude (e.g. frontend/src/lib)",
+    )
+    parser.add_argument(
+        "--no-code-age",
+        action="store_true",
+        help=(
+            "Skip the code-age table (lines at HEAD by last commit date). "
+            "Saves time on very large repositories."
+        ),
+    )
+    parser.add_argument(
+        "--code-age-top-modules",
+        type=int,
+        default=5,
+        metavar="N",
+        help=(
+            "For each code-age bucket, list the top N modules (directory path, no filename) "
+            "by lines in that bucket. Use 0 to disable. Default: 5."
+        ),
     )
     args = parser.parse_args()
 
@@ -424,6 +735,98 @@ def main():
         total = adds + dels
         bar = '█' * (count // 5)
         print(f"  {year:<10}{count:<10}{'+'+str(adds):<10}{'-'+str(dels):<10}{total:<12}{bar}")
+
+    # === CODE AGE (lines at HEAD, by years since last file change) ===
+    code_age_data = None
+    if not args.no_code_age:
+        print("\n" + "=" * 80)
+        print("CODE AGE (share of current lines by last modification)")
+        print("=" * 80)
+        code_age_data = compute_code_age_by_lines(
+            args.path,
+            file_commits,
+            commit_dates,
+            args.exclude,
+            top_modules_per_bucket=args.code_age_top_modules,
+        )
+        if code_age_data.get("error"):
+            print(f"  Could not compute code age: {code_age_data['error']}")
+        elif code_age_data.get("total_lines", 0) == 0:
+            print("  No lines counted (empty repo or no readable text files at HEAD).")
+        else:
+            gm = code_age_data.get("grouping_mode", "year")
+            rsd = code_age_data.get("repo_span_days")
+            if gm == "week":
+                grp = (
+                    "Grouping: ISO week of last file change "
+                    "(repository history spans < 6 months)."
+                )
+            elif gm == "month":
+                grp = (
+                    "Grouping: calendar month of last file change "
+                    "(6 months ≤ repository age < 2 years)."
+                )
+            else:
+                grp = (
+                    "Grouping: years since last change, buckets 0–1 … 23–24, then 24+ "
+                    "(repository age ≥ 2 years)."
+                )
+            print(
+                "\n  Each file's lines at HEAD are assigned to the latest commit that "
+                "touched that file\n  (non-merge history). This approximates how stale "
+                "code is; it is not per-line blame.\n"
+            )
+            print(f"  {grp}")
+            if rsd is not None:
+                print(f"  Repository span (oldest commit → now): {rsd} days.")
+            print(
+                f"\n  Reference time: {code_age_data['reference_time_utc']} (UTC)\n"
+                f"  Total lines counted: {code_age_data['total_lines']:,}"
+            )
+            if code_age_data.get("unknown_lines", 0) > 0:
+                print(
+                    f"  Unknown age (no date): {code_age_data['unknown_lines']:,} lines "
+                    f"({code_age_data.get('unknown_pct', 0):.1f}%)"
+                )
+            label_w = 40
+            print(f"\n  {'Period':<{label_w}} {'Lines':>12} {'Share':>10}")
+            print("  " + "-" * (label_w + 24))
+            for row in code_age_data["buckets"]:
+                bar = "█" * max(1, int(row["pct"] / 2)) if row["lines"] else ""
+                lab = row["label"]
+                if len(lab) > label_w:
+                    lab = lab[: label_w - 1] + "…"
+                print(
+                    f"  {lab:<{label_w}} {row['lines']:>12,} "
+                    f"{row['pct']:>9.1f}%  {bar}"
+                )
+
+            if args.code_age_top_modules > 0:
+                print("\n" + "=" * 80)
+                print("TOP MODULES PER CODE AGE BUCKET (by lines in bucket)")
+                print("=" * 80)
+                print(
+                    "\n  Module = directory path without filename (same as COMMITS PER MODULE). "
+                    "Share is % of lines within that bucket.\n"
+                )
+                for row in code_age_data["buckets"]:
+                    tm = row.get("top_modules") or []
+                    if not tm:
+                        continue
+                    hdr = (
+                        f"  {row['label']}\n"
+                        f"  Bucket: {row['lines']:,} lines ({row['pct']:.1f}% of repository)"
+                    )
+                    print(f"\n{hdr}")
+                    print(f"  {'Rank':<6}{'Lines':>10}{'% of bucket':>14}  Module")
+                    print("  " + "-" * 72)
+                    for rank, m in enumerate(tm, 1):
+                        mod = m["module"]
+                        if len(mod) > 48:
+                            mod = mod[:47] + "…"
+                        print(
+                            f"  {rank:<6}{m['lines']:>10,}{m['pct_of_bucket']:>13.1f}%  {mod}"
+                        )
 
     # === BUG FIXES VS FEATURES OVER TIME (monthly) ===
     print("\n" + "=" * 80)
@@ -565,6 +968,7 @@ def main():
         'modules': module_counts,
         'module_bugs': module_bugs,
         'module_features': module_features,
+        'code_age_by_lines': code_age_data,
     }
 
     output_json = 'commit_analysis_results.json'

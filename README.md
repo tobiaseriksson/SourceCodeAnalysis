@@ -163,8 +163,9 @@ The report includes:
 - **Authors**: who has the most commits.
 - **Timeline**: commits and line churn by year; bug vs feature counts by month.
 - **Modules**: inferred from file paths (top-level path segment), with bug/feature counts per module.
+- **Code age** (optional): table of **what share of today’s lines** (at `HEAD`) fall into time buckets by **last file change**. The **granularity** depends on how long the **repository history** is (oldest commit → now): **under ~6 months** → **ISO week**; **6 months to under 2 years** → **calendar month** (`YYYY-MM`); **2 years or more** → **years since last change** with buckets from 0–1y through 23–24y, then **24+ years**. This uses the **latest commit date per file** (not per-line `git blame`). After the table, you can list the **top N modules** (directory path without filename) **per bucket** by lines in that bucket, via **`--code-age-top-modules N`** (default **5**; use **0** to disable). Use **`--no-code-age`** to skip this step on huge repos (it runs `git ls-files` and `git show` per file).
 
-Use **`--exclude`** to drop path prefixes from stats (for example generated or vendor trees).
+Use **`--exclude`** to drop path prefixes from stats (for example generated or vendor trees). Excludes apply to the code-age scan as well.
 
 ### Prerequisites
 
@@ -179,6 +180,8 @@ Use **`--exclude`** to drop path prefixes from stats (for example generated or v
 | `--commit-history FILE` | `-H` | Read history from **FILE** (same format as `git log --numstat --no-merges`) instead of running Git. |
 | `--export-commit-history [FILE]` | `-E` | After fetching from Git, write the raw log to **FILE**. Default file name: **`commit-history.txt`**. Cannot be combined with `-H`. |
 | `--exclude …` | | Path prefixes to skip (for example `vendor/` `node_modules/`). |
+| `--no-code-age` | | Skip the **code-age** table (faster on very large repositories). |
+| `--code-age-top-modules N` | | Per code-age bucket, show the top **N** modules by lines in that bucket (default **5**; **0** = off). |
 
 Examples:
 
