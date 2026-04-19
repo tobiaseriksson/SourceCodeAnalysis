@@ -4,11 +4,11 @@ A small collection of **standalone Python 3** command-line tools for **static an
 
 The main tools are:
 
-| Tool | Purpose |
-|------|---------|
-| [`complexity_analysis.py`](complexity_analysis.py) | Measures **structural complexity** (cyclomatic and cognitive complexity, nesting, lines of code, and a simple health score). |
-| [`logging_analysis.py`](logging_analysis.py) | Measures **logging and diagnostic output**—how dense logging is, which APIs and levels are used, and where the hotspots are. |
-| [`analyze_commits.py`](analyze_commits.py) | Summarizes **Git commit history** (churn, authors, categories, trends) from `git log` or a saved export. |
+| Tool | Purpose | Sample output |
+|------|---------|---------------|
+| [`complexity_analysis.py`](complexity_analysis.py) | Measures **structural complexity** (cyclomatic and cognitive complexity, nesting, lines of code, and a simple health score). | [Sample_Complexity_Analysis.md](Sample_Complexity_Analysis.md) |
+| [`logging_analysis.py`](logging_analysis.py) | Measures **logging and diagnostic output**—how dense logging is, which APIs and levels are used, and where the hotspots are. | [Sample_Logging_analysis.md](Sample_Logging_analysis.md) |
+| [`analyze_commits.py`](analyze_commits.py) | Summarizes **Git commit history** (churn, authors, categories, trends) from `git log` or a saved export. | [Sample_Git_Analysis.md](Sample_Git_Analysis.md) |
 
 **`complexity_analysis.py`** and **`logging_analysis.py`** walk a directory tree, respect the same **exclude** rules, skip common build/vendor folders by default, and support **plain text** or **JSON** output. **`analyze_commits.py`** works on a repository path (or a pre-exported log) and prints a report plus a JSON summary file.
 
@@ -24,6 +24,8 @@ Install nothing else; the scripts use only the standard library.
 
 ## `complexity_analysis.py`
 
+**Sample output:** [Sample_Complexity_Analysis.md](Sample_Complexity_Analysis.md)
+
 ### What it does
 
 `complexity_analysis.py` analyzes source files and computes **per-file** and **project-wide** metrics:
@@ -33,6 +35,20 @@ Install nothing else; the scripts use only the standard library.
 - **Lines**: total, code, comments, and blank lines.
 - **Maximum nesting depth** and **function counts** (with optional per-function detail when verbose).
 - An **overall health score** on a 1–5 scale.
+
+### Risk bands (text / JSON summary)
+
+The tool classifies each **non-markup file** into five bands by **per-file** totals (cyclomatic and cognitive are **whole-file** sums; nesting is **maximum brace/block depth** in that file; functions is the **count of detected units** in that file). **HTML, CSHTML, and Razor** are omitted from these aggregates and distributions.
+
+| Band | Cyclomatic (McCabe, per file) | Cognitive (per file) | Nesting (max depth / file) | Functions (count / file) |
+|------|------------------------------|------------------------|----------------------------|--------------------------|
+| **Low** | 1–10 | 0–15 | 0–2 | 0–10 |
+| **Moderate** | 11–20 | 16–25 | 3–4 | 11–25 |
+| **High** | 21–50 | 26–50 | 5–6 | 26–50 |
+| **Very high** | 51–100 | 51–100 | 7–9 | 51–100 |
+| **Extreme** | >100 | >100 | ≥10 | >100 |
+
+Cyclomatic bands follow SEI / C4–style tables (see JetBrains ReSharper cyclomatic docs). Cognitive edges align with Sonar **S3776** (15 per method) for the lower band. Nesting references **ESLint `max-depth`** (default 4) and deep-nesting rules such as Sonar **S134**. Function-count bands are **heuristic** (same numeric cut points as CC/cog for consistency). Thresholds are defined as constants near the top of [`complexity_analysis.py`](complexity_analysis.py).
 
 ### Supported languages (`complexity_analysis.py`)
 
@@ -98,6 +114,8 @@ python3 -m unittest test_complexity_analysis -v
 
 ## `logging_analysis.py`
 
+**Sample output:** [Sample_Logging_analysis.md](Sample_Logging_analysis.md)
+
 ### What it does
 
 `logging_analysis.py` scans source code for **real logging and print-style calls**, using language-specific patterns (for example `ILogger` / Serilog in C#, `console.log` in JS/TS, `logging.info` / `logger` in Python, `fmt.Println` in Go, and many others). It is designed to **avoid naive false positives** from words like “log” inside identifiers when possible.
@@ -151,6 +169,8 @@ Use **`--verbose`** for the full per-file table and **`--json`** when you need m
 ---
 
 ## `analyze_commits.py`
+
+**Sample output:** [Sample_Git_Analysis.md](Sample_Git_Analysis.md)
 
 ### What it does
 
