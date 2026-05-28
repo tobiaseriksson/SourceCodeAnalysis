@@ -730,6 +730,137 @@ _RE_NAMESPACE = re.compile(r"\bnamespace\s+")
 _RE_CLASS_LIKE = re.compile(r"\b(?:class|struct|enum|interface|record)\s+")
 
 
+def _clean_cstyle_code(content: str, lang: str) -> str:
+    """Strip comments and string literals from a C-style code string.
+
+    Preserves all line breaks and replaces stripped content with spaces
+    so that line numbers and positions align perfectly.
+    """
+    chars = list(content)
+    length = len(chars)
+    i = 0
+    cleaned = []
+    state = "NORMAL"
+
+    while i < length:
+        c = chars[i]
+        next_c = chars[i+1] if i + 1 < length else ""
+
+        if state == "NORMAL":
+            if c == "/" and next_c == "/":
+                state = "LINE_COMMENT"
+                cleaned.append(" ")
+                cleaned.append(" ")
+                i += 2
+                continue
+            elif c == "/" and next_c == "*":
+                state = "BLOCK_COMMENT"
+                cleaned.append(" ")
+                cleaned.append(" ")
+                i += 2
+                continue
+            elif lang == "php" and c == "#":
+                state = "LINE_COMMENT"
+                cleaned.append(" ")
+                i += 1
+                continue
+            elif c == "'":
+                state = "STRING_SINGLE"
+                cleaned.append(" ")
+                i += 1
+                continue
+            elif c == '"':
+                state = "STRING_DOUBLE"
+                cleaned.append(" ")
+                i += 1
+                continue
+            elif lang in ("js", "ts", "jsx", "tsx") and c == "`":
+                state = "STRING_BACKTICK"
+                cleaned.append(" ")
+                i += 1
+                continue
+            else:
+                cleaned.append(c)
+                i += 1
+                continue
+
+        elif state == "LINE_COMMENT":
+            if c == "\n":
+                state = "NORMAL"
+                cleaned.append("\n")
+            else:
+                cleaned.append(" ")
+            i += 1
+            continue
+
+        elif state == "BLOCK_COMMENT":
+            if c == "*" and next_c == "/":
+                state = "NORMAL"
+                cleaned.append(" ")
+                cleaned.append(" ")
+                i += 2
+            elif c == "\n":
+                cleaned.append("\n")
+                i += 1
+            else:
+                cleaned.append(" ")
+                i += 1
+            continue
+
+        elif state == "STRING_SINGLE":
+            if c == "\\":
+                cleaned.append(" ")
+                cleaned.append(" ")
+                i += 2
+            elif c == "'":
+                state = "NORMAL"
+                cleaned.append(" ")
+                i += 1
+            elif c == "\n":
+                cleaned.append("\n")
+                i += 1
+            else:
+                cleaned.append(" ")
+                i += 1
+            continue
+
+        elif state == "STRING_DOUBLE":
+            if c == "\\":
+                cleaned.append(" ")
+                cleaned.append(" ")
+                i += 2
+            elif c == '"':
+                state = "NORMAL"
+                cleaned.append(" ")
+                i += 1
+            elif c == "\n":
+                cleaned.append("\n")
+                i += 1
+            else:
+                cleaned.append(" ")
+                i += 1
+            continue
+
+        elif state == "STRING_BACKTICK":
+            if c == "\\":
+                cleaned.append(" ")
+                cleaned.append(" ")
+                i += 2
+            elif c == "`":
+                state = "NORMAL"
+                cleaned.append(" ")
+                i += 1
+            elif c == "\n":
+                cleaned.append("\n")
+                i += 1
+            else:
+                cleaned.append(" ")
+                i += 1
+            continue
+
+    return "".join(cleaned)
+
+
 def _analyze_cstyle(content: str, fm: FileMetrics) -> FileMetrics:
     """Analyze a C-style (brace-delimited) language file.
 
@@ -745,6 +876,10 @@ def _analyze_cstyle(content: str, fm: FileMetrics) -> FileMetrics:
     lines = content.split("\n")
     fm.total_lines = len(lines)
 
+    # Pre-process the content to strip out strings and comments for complexity and nesting analysis
+    cleaned_content = _clean_cstyle_code(content, fm.lang)
+    clean_lines = cleaned_content.split("\n")
+
     in_block_comment = False
     nesting_stack = []
     cognitive_nesting = 0
@@ -758,10 +893,10 @@ def _analyze_cstyle(content: str, fm: FileMetrics) -> FileMetrics:
     }
     func_pat = _FUNC_PATTERNS.get(fm.lang)
 
-    for line in lines:
+    for i, line in enumerate(lines):
         stripped = line.strip()
 
-        # ── Line classification ──
+        # ── Line classification (uses raw source to count comments correctly) ──
         if not stripped:
             fm.blank_lines += 1
             continue
@@ -806,24 +941,28 @@ def _analyze_cstyle(content: str, fm: FileMetrics) -> FileMetrics:
 
         fm.code_lines += 1
 
+        # ── Complexity & Nesting Analysis (uses cleaned source to ignore strings/comments) ──
+        clean_line = clean_lines[i]
+        clean_stripped = clean_line.strip()
+
         # ── Function/method detection ──
-        if func_pat and func_pat.search(stripped):
+        if func_pat and func_pat.search(clean_stripped):
             fm.functions += 1
 
         # ── Cyclomatic complexity ──
         for pattern in cc_pats:
-            fm.cyclomatic += len(pattern.findall(stripped))
+            fm.cyclomatic += len(pattern.findall(clean_stripped))
 
         # ── Determine if this line has non-nesting braces ──
         is_non_nesting_brace = bool(
-            _RE_TRY.search(stripped) or
-            _RE_FINALLY.search(stripped) or
-            _RE_NAMESPACE.search(stripped) or
-            _RE_CLASS_LIKE.search(stripped)
+            _RE_TRY.search(clean_stripped) or
+            _RE_FINALLY.search(clean_stripped) or
+            _RE_NAMESPACE.search(clean_stripped) or
+            _RE_CLASS_LIKE.search(clean_stripped)
         )
 
         # ── Process closing braces BEFORE scoring ──
-        closes = stripped.count("}")
+        closes = clean_stripped.count("}")
         for _ in range(closes):
             if nesting_stack:
                 was_nesting = nesting_stack.pop()
@@ -832,17 +971,17 @@ def _analyze_cstyle(content: str, fm: FileMetrics) -> FileMetrics:
 
         # ── Cognitive complexity (SonarSource 2023 spec) ──
         for pattern in cog_struct_pats:
-            matches = pattern.findall(stripped)
+            matches = pattern.findall(clean_stripped)
             for _ in matches:
                 fm.cognitive += 1 + cognitive_nesting
 
         for pattern in cog_hybrid_pats:
-            fm.cognitive += len(pattern.findall(stripped))
+            fm.cognitive += len(pattern.findall(clean_stripped))
 
-        fm.cognitive += _count_logical_operator_sequences(stripped)
+        fm.cognitive += _count_logical_operator_sequences(clean_stripped)
 
         # ── Process opening braces AFTER scoring ──
-        opens = stripped.count("{")
+        opens = clean_stripped.count("{")
         for _ in range(opens):
             if is_non_nesting_brace:
                 nesting_stack.append(False)

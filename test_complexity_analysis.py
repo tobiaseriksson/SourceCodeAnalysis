@@ -647,6 +647,41 @@ class TestNesting(unittest.TestCase):
             "  }\n}", lang="cs")
         self.assertEqual(nest, 4)
 
+    def test_braces_in_strings_ignored(self):
+        """Curly braces inside strings must be completely ignored for nesting depth."""
+        code = (
+            "if (a) {\n"
+            "  string s1 = \"{\";\n"
+            "  string s2 = \"}\";\n"
+            "  string s3 = \"nested { braces } here\";\n"
+            "}"
+        )
+        _, _, nest = analyze(code, lang="js")
+        self.assertEqual(nest, 1, "braces in strings should not affect nesting")
+
+    def test_braces_in_comments_ignored(self):
+        """Curly braces inside single-line and multi-line comments must be ignored."""
+        code = (
+            "if (a) {\n"
+            "  // a comment with }\n"
+            "  /* multi line\n"
+            "     comment with {\n"
+            "  */\n"
+            "}"
+        )
+        _, _, nest = analyze(code, lang="js")
+        self.assertEqual(nest, 1, "braces in comments should not affect nesting")
+
+    def test_json_literal_ignored(self):
+        """Large JSON literal on a single line or multiple lines should not skew nesting."""
+        code = (
+            "if (a) {\n"
+            "  const json = '[{\"a\": {\"b\": 1}}, {\"c\": 2}]';\n"
+            "}"
+        )
+        _, _, nest = analyze(code, lang="js")
+        self.assertEqual(nest, 1, "JSON strings should not skew nesting")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CROSS-METRIC INTEGRATION TESTS
