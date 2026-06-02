@@ -28,8 +28,8 @@ import json
 import argparse
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
-
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
 import subprocess
 import sys
 
@@ -215,18 +215,6 @@ def extract_module(filepath):
     return '/'.join(parts[:-1])
 
 
-def parse_git_commit_date(date_str):
-    """Parse git `Date:` header value, e.g. 'Thu Mar 18 14:42:51 2021 +0100'."""
-    if not date_str:
-        return None
-    date_str = date_str.strip()
-    try:
-        return datetime.strptime(date_str, "%a %b %d %H:%M:%S %Y %z")
-    except ValueError:
-        pass
-    return None
-
-
 def parse_git_iso_date(date_str):
     """Parse `git log --format=%cI` output, e.g. '2021-03-18T14:42:51+01:00'."""
     if not date_str:
@@ -249,73 +237,6 @@ def parse_git_iso_date(date_str):
         return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return None
-
-
-def _last_mod_datetime_for_file(repo_root, git_path, file_commits, commit_dates):
-    """Latest commit date touching ``git_path`` from parsed history, else `git log -1`."""
-    commits = file_commits.get(git_path)
-    best = None
-    if commits:
-        for c in commits:
-            ds = commit_dates.get(c)
-            if not ds:
-                continue
-            dt = parse_git_commit_date(ds)
-            if dt is not None and (best is None or dt > best):
-                best = dt
-    if best is not None:
-        return best
-    git_path_n = git_path.replace("\\", "/")
-    try:
-        r = subprocess.run(
-            ["git", "log", "-1", "--format=%cI", "--", git_path_n],
-            cwd=repo_root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return parse_git_iso_date(r.stdout.strip())
-    except OSError:
-        pass
-    return None
-
-
-def _line_count_at_head(repo_root, git_path):
-    """Line count of file at HEAD; 0 if missing, binary, or unreadable."""
-    git_path_n = git_path.replace("\\", "/")
-    try:
-        r = subprocess.run(
-            ["git", "show", f"HEAD:{git_path_n}"],
-            cwd=repo_root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if r.returncode != 0 or not r.stdout:
-            return 0
-        data = r.stdout
-        if b"\x00" in data[:65536]:
-            return 0
-        text = data.decode("utf-8", errors="replace")
-        if not text:
-            return 0
-        return len(text.splitlines())
-    except OSError:
-        return 0
-
-
-def _oldest_commit_datetime(commit_dates):
-    """Earliest commit timestamp in parsed history (for repository age)."""
-    best = None
-    for ds in commit_dates.values():
-        dt = parse_git_commit_date(ds)
-        if dt is None:
-            continue
-        if best is None or dt < best:
-            best = dt
-    return best
 
 
 def _code_age_grouping_mode(repo_span_days):
@@ -380,35 +301,100 @@ def _sort_code_age_bucket_keys(keys):
     return sorted(keys, key=sk)
 
 
-def compute_code_age_by_lines(
+def _blame_file(repo_root, git_path):
+    """Run git blame --porcelain on a file and return (git_path, line_commits, commit_info)."""
+    git_path_n = git_path.replace("\\", "/")
+    try:
+        r = subprocess.run(
+            ["git", "blame", "--porcelain", "--", git_path_n],
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if r.returncode != 0 or not r.stdout:
+            return git_path, [], {}
+        
+        # Binary check
+        data = r.stdout
+        if b"\x00" in data[:65536]:
+            return git_path, [], {}
+            
+        text = data.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        
+        line_commits = []
+        commit_info = {}
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            parts = line.split()
+            if not parts:
+                i += 1
+                continue
+                
+            commit_hash = parts[0]
+            line_commits.append(commit_hash)
+            
+            i += 1
+            while i < len(lines):
+                cur = lines[i]
+                if cur.startswith('\t'):
+                    i += 1
+                    break
+                if cur.startswith('author '):
+                    author_name = cur[7:].strip()
+                    if commit_hash not in commit_info:
+                        commit_info[commit_hash] = {}
+                    commit_info[commit_hash]["author"] = author_name
+                elif cur.startswith('author-time '):
+                    try:
+                        author_time = int(cur.split()[1])
+                        if commit_hash not in commit_info:
+                            commit_info[commit_hash] = {}
+                        commit_info[commit_hash]["time"] = author_time
+                    except (ValueError, IndexError):
+                        pass
+                i += 1
+                
+        return git_path, line_commits, commit_info
+    except Exception:
+        return git_path, [], {}
+
+
+def compute_code_age_by_blame(
     repo_root,
-    file_commits,
-    commit_dates,
     exclude_paths,
     top_modules_per_bucket=5,
 ):
-    """Distribute current line counts at HEAD into age buckets.
+    """Distribute current lines at HEAD into age buckets using true git blame.
 
-    Grouping depends on **repository age** (oldest commit in parsed history → now):
-
-    - **< ~6 months**: buckets by **ISO week** of last file change.
-    - **6 months … < 2 years**: buckets by **calendar month** of last file change.
-    - **≥ 2 years**: buckets by **years since last change**, from 0–1y … 23–24y, then **24+y**.
-
-    Approximation: all lines in a file inherit the **latest** commit date that touched
-    that file in the parsed (non-merge) history. This is not per-line `git blame`.
-
-    For each bucket, the top ``top_modules_per_bucket`` modules (directory path without
-    filename) by line count in that bucket are attached as ``top_modules``.
-
-    Returns dict with ``grouping_mode``, ``repo_span_days``, ``buckets`` (each with
-    ``label``, ``lines``, ``pct``, ``top_modules``), etc.
+    Excludes paths using the normalized exclude filter.
+    Uses ThreadPoolExecutor to run git blame --porcelain in parallel.
     """
     root = os.path.abspath(repo_root)
     exclude_normalized = [ex.strip().lstrip("./") for ex in (exclude_paths or []) if ex.strip()]
     now = datetime.now(timezone.utc)
 
-    oldest = _oldest_commit_datetime(commit_dates)
+    # Determine oldest commit date to compute total span
+    try:
+        r = subprocess.run(
+            ["git", "log", "--reverse", "--format=%cI"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            first_line = r.stdout.splitlines()[0].strip()
+            oldest = parse_git_iso_date(first_line)
+        else:
+            oldest = None
+    except Exception:
+        oldest = None
+
     repo_span_days = None
     oldest_iso = None
     if oldest is not None:
@@ -419,6 +405,7 @@ def compute_code_age_by_lines(
 
     mode = _code_age_grouping_mode(repo_span_days)
 
+    # 1. Fetch tracked files
     try:
         ls = subprocess.run(
             ["git", "ls-files"],
@@ -436,30 +423,108 @@ def compute_code_age_by_lines(
             "unknown_lines": 0,
             "grouping_mode": mode,
             "repo_span_days": repo_span_days,
+            "oldest_commit_utc": oldest_iso,
+            "author_lines": {},
         }
 
     paths = [p.strip() for p in ls.stdout.splitlines() if p.strip()]
-    bucket_lines = Counter()
-    bucket_module_lines = defaultdict(Counter) if top_modules_per_bucket else None
-    unknown_lines = 0
-    total_lines = 0
-
+    
+    # Filter paths
+    filtered_paths = []
     for git_path in paths:
         if any(git_path.startswith(ex) or git_path == ex.rstrip("/") for ex in exclude_normalized):
             continue
-        lines = _line_count_at_head(root, git_path)
-        if lines <= 0:
-            continue
-        total_lines += lines
-        last_mod = _last_mod_datetime_for_file(root, git_path, file_commits, commit_dates)
-        if last_mod is None:
-            unknown_lines += lines
-            continue
-        key = _code_age_bucket_key(last_mod, now, mode)
-        bucket_lines[key] += lines
-        if bucket_module_lines is not None:
+        filtered_paths.append(git_path)
+
+    print(f"Running git blame on {len(filtered_paths)} files in parallel (using threads)...")
+
+    # 2. Run git blame in parallel
+    global_commit_dates = {}  # commit_hash -> datetime
+    global_commit_authors = {}  # commit_hash -> author_name
+    bucket_lines = Counter()
+    bucket_module_lines = defaultdict(Counter) if top_modules_per_bucket else None
+    author_lines = Counter()
+    total_lines = 0
+    unknown_lines = 0
+
+    max_workers = min(32, (multiprocessing.cpu_count() or 4) * 4)
+    
+    def _dt_from_epoch(seconds):
+        return datetime.fromtimestamp(seconds, timezone.utc)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_blame_file, root, path): path for path in filtered_paths}
+        
+        completed = 0
+        for future in as_completed(futures):
+            git_path, line_commits, commit_info = future.result()
+            completed += 1
+            if completed % 200 == 0 or completed == len(filtered_paths):
+                print(f"  Processed {completed}/{len(filtered_paths)} files...")
+                
+            if not line_commits:
+                continue
+                
             module = extract_module(git_path.replace("\\", "/"))
-            bucket_module_lines[key][module] += lines
+            
+            # Map of this file's commit hashes to datetimes and authors
+            file_dates = {}
+            file_authors = {}
+            for h, info in commit_info.items():
+                if "time" in info:
+                    file_dates[h] = _dt_from_epoch(info["time"])
+                if "author" in info:
+                    file_authors[h] = info["author"]
+                
+            for commit_hash in line_commits:
+                total_lines += 1
+                dt = file_dates.get(commit_hash)
+                author = file_authors.get(commit_hash)
+                
+                if dt is None:
+                    dt = global_commit_dates.get(commit_hash)
+                if author is None:
+                    author = global_commit_authors.get(commit_hash)
+                    
+                if dt is None or author is None:
+                    # Fallback log query
+                    try:
+                        r = subprocess.run(
+                            ["git", "log", "-1", "--format=%cI|%an", commit_hash],
+                            cwd=root,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            text=True,
+                            check=False,
+                        )
+                        if r.returncode == 0 and r.stdout.strip():
+                            parts = r.stdout.strip().split('|')
+                            if len(parts) == 2:
+                                date_str, author_str = parts
+                                parsed_dt = parse_git_iso_date(date_str)
+                                if parsed_dt:
+                                    dt = parsed_dt
+                                    global_commit_dates[commit_hash] = dt
+                                author = author_str.strip()
+                                global_commit_authors[commit_hash] = author
+                    except Exception:
+                        pass
+                
+                if dt is None:
+                    unknown_lines += 1
+                    continue
+                    
+                global_commit_dates[commit_hash] = dt
+                if author:
+                    global_commit_authors[commit_hash] = author
+                    author_lines[author] += 1
+                else:
+                    author_lines["(unknown)"] += 1
+                
+                key = _code_age_bucket_key(dt, now, mode)
+                bucket_lines[key] += 1
+                if bucket_module_lines is not None:
+                    bucket_module_lines[key][module] += 1
 
     sorted_keys = _sort_code_age_bucket_keys(bucket_lines.keys())
     buckets = []
@@ -500,6 +565,7 @@ def compute_code_age_by_lines(
         "grouping_mode": mode,
         "repo_span_days": repo_span_days,
         "oldest_commit_utc": oldest_iso,
+        "author_lines": dict(author_lines),
     }
 
 
@@ -513,7 +579,7 @@ def categorize_commit(message):
 
     # Bug fix patterns
     bug_patterns = [
-        r'\bfix(ed|es|ing)?\b', r'\bbug(fix|s)?\b', r'\bhotfix\b',
+        r'\bfix(ed|es|ing)?\b', r'\bbug(fix|s)?\b', r'\bbotfix\b', r'\bhotfix\b',
         r'\bpatch(ed|es|ing)?\b', r'\bcorrect(ed|s|ing|ion)?\b',
         r'\bsolve[ds]?\b', r'\bresolve[ds]?\b', r'\brepair\b',
         r'\bissue\b', r'\berror\b', r'\bcrash\b', r'\bbroken\b',
@@ -736,19 +802,18 @@ def main():
         bar = '█' * (count // 5)
         print(f"  {year:<10}{count:<10}{'+'+str(adds):<10}{'-'+str(dels):<10}{total:<12}{bar}")
 
-    # === CODE AGE (lines at HEAD, by years since last file change) ===
+    # === CODE AGE & AUTHOR SURVIVING CODE OWNERSHIP (blame-based) ===
     code_age_data = None
     if not args.no_code_age:
         print("\n" + "=" * 80)
-        print("CODE AGE (share of current lines by last modification)")
+        print("CODE AGE & SURVIVING LINES (per-line git blame analysis at HEAD)")
         print("=" * 80)
-        code_age_data = compute_code_age_by_lines(
+        code_age_data = compute_code_age_by_blame(
             args.path,
-            file_commits,
-            commit_dates,
             args.exclude,
             top_modules_per_bucket=args.code_age_top_modules,
         )
+            
         if code_age_data.get("error"):
             print(f"  Could not compute code age: {code_age_data['error']}")
         elif code_age_data.get("total_lines", 0) == 0:
@@ -772,9 +837,8 @@ def main():
                     "(repository age ≥ 2 years)."
                 )
             print(
-                "\n  Each file's lines at HEAD are assigned to the latest commit that "
-                "touched that file\n  (non-merge history). This approximates how stale "
-                "code is; it is not per-line blame.\n"
+                "\n  Each line at HEAD is blamed to its exact committing date using git blame.\n"
+                "  This is a true per-line age distribution showing exactly when every line was written.\n"
             )
             print(f"  {grp}")
             if rsd is not None:
@@ -827,6 +891,18 @@ def main():
                         print(
                             f"  {rank:<6}{m['lines']:>10,}{m['pct_of_bucket']:>13.1f}%  {mod}"
                         )
+
+            if "author_lines" in code_age_data:
+                print("\n" + "=" * 80)
+                print("SURVIVING LINES OF CODE BY AUTHOR (from git blame)")
+                print("=" * 80)
+                print(f"{'Rank':<6}{'Lines':<12}{'Percentage':<12}{'Author'}")
+                print("-" * 80)
+                auth_lines = Counter(code_age_data["author_lines"])
+                total_auth_lines = sum(auth_lines.values())
+                for rank, (auth, count) in enumerate(auth_lines.most_common(20), 1):
+                    pct = (count / total_auth_lines * 100) if total_auth_lines > 0 else 0
+                    print(f"{rank:<6}{count:<12,}{pct:>5.1f}%       {auth}")
 
     # === BUG FIXES VS FEATURES OVER TIME (monthly) ===
     print("\n" + "=" * 80)
