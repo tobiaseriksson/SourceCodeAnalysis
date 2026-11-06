@@ -1,0 +1,151 @@
+{
+  "source": "OrderService.cs",
+  "generated_by": "tools/roslyn_check/Oracle.cs (Roslyn syntax tree)",
+  "file_cyclomatic": 46,
+  "functions": [
+    {
+      "name": "OrderService",
+      "line": 28,
+      "cyclomatic": 2,
+      "cognitive": 1
+    },
+    {
+      "name": "Count.get",
+      "line": 40,
+      "cyclomatic": 2,
+      "cognitive": 1
+    },
+    {
+      "name": "Count.set",
+      "line": 41,
+      "cyclomatic": 3,
+      "cognitive": 2
+    },
+    {
+      "name": "ResetCache",
+      "line": 54,
+      "cyclomatic": 3,
+      "cognitive": 3
+    },
+    {
+      "name": "Find",
+      "line": 66,
+      "cyclomatic": 2,
+      "cognitive": 1
+    },
+    {
+      "name": "FindAsync",
+      "line": 71,
+      "cyclomatic": 4,
+      "cognitive": 3
+    },
+    {
+      "name": "Describe",
+      "line": 93,
+      "cyclomatic": 5,
+      "cognitive": 1
+    },
+    {
+      "name": "Label",
+      "line": 108,
+      "cyclomatic": 2,
+      "cognitive": 1
+    },
+    {
+      "name": "Filter",
+      "line": 119,
+      "cyclomatic": 5,
+      "cognitive": 4
+    },
+    {
+      "name": "Process",
+      "line": 128,
+      "cyclomatic": 7,
+      "cognitive": 9
+    },
+    {
+      "name": "Retry",
+      "line": 161,
+      "cyclomatic": 3,
+      "cognitive": 2
+    },
+    {
+      "name": "FirstOrDefault",
+      "line": 171,
+      "cyclomatic": 3,
+      "cognitive": 3
+    },
+    {
+      "name": "Wait",
+      "line": 180,
+      "cyclomatic": 4,
+      "cognitive": 3
+    },
+    {
+      "name": "Validate",
+      "line": 194,
+      "cyclomatic": 3,
+      "cognitive": 2
+    },
+    {
+      "name": "Name2",
+      "line": 203,
+      "cyclomatic": 2,
+      "cognitive": 1
+    },
+    {
+      "name": "operator int",
+      "line": 207,
+      "cyclomatic": 1,
+      "cognitive": 0
+    },
+    {
+      "name": "Changed.add",
+      "line": 214,
+      "cyclomatic": 2,
+      "cognitive": 1
+    },
+    {
+      "name": "Changed.remove",
+      "line": 215,
+      "cyclomatic": 1,
+      "cognitive": 0
+    },
+    {
+      "name": "this[].get",
+      "line": 221,
+      "cyclomatic": 2,
+      "cognitive": 1
+    },
+    {
+      "name": "Dispose",
+      "line": 227,
+      "cyclomatic": 1,
+      "cognitive": 0
+    },
+    {
+      "name": "OrderService",
+      "line": 238,
+      "cyclomatic": 1,
+      "cognitive": 0
+    },
+    {
+      "name": "Dispose",
+      "line": 245,
+      "cyclomatic": 1,
+      "cognitive": 0
+    },
+    {
+      "name": "CanHandle",
+      "line": 253,
+      "cyclomatic": 1,
+      "cognitive": 0
+    },
+    {
+      "name": "HandleAll",
+      "line": 258,
+      "cyclomatic": 3,
+      "cognitive": 3
+    }
+  ]
+}

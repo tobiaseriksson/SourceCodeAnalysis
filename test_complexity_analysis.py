@@ -64,8 +64,17 @@ How to run:
     Python indentation analyzer & Go/Rust extras (6 tests):
       TestPythonIndentationMetrics, TestGoRustCyclomaticExtras
 
+    String/comment cleaning, function detection, Vue/Svelte & new file types:
+      TestCleanerLineAlignment, TestFunctionDetection, TestSingleFileComponents
+
+    Fixes verified against Roslyn (the C# compiler), see tools/roslyn_check/:
+      TestTernaryDetection, TestCatchDetection, TestParenlessConditions,
+      TestCognitiveNestingRoles, TestBracelessBodies, TestMultiLineLogicalSequences,
+      TestCSharpSwitchAndWhen, TestCSharpFunctionDetection, TestJsArrowFunctions,
+      TestCSharpRoslynFixture
+
   Expected output (all tests passing):
-    Ran 88 tests in 0.002s
+    Ran 154 tests in 0.04s
     OK
 """
 
@@ -75,7 +84,14 @@ from complexity_analysis import (
     FileMetrics,
     _analyze_cstyle,
     _analyze_indentation_based,
+    _clean_cstyle_code,
     _count_logical_operator_sequences,
+    _detect_lang,
+    _extract_sfc_script,
+    _analyze_functions,
+    _find_function_boundaries,
+    analyze_file,
+    scan_project,
 )
 
 
@@ -826,6 +842,527 @@ class TestGoRustCyclomaticExtras(unittest.TestCase):
         )
         cc, _, _ = analyze(code, lang="rust")
         self.assertEqual(cc, 4, "base 1 + three => arms (like switch cases)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  STRING / COMMENT CLEANING — line alignment and multi-line string literals
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCleanerLineAlignment(unittest.TestCase):
+    """The cleaned source must keep every line, or metrics shift / crash."""
+
+    def assert_same_lines(self, code, lang):
+        cleaned = _clean_cstyle_code(code, lang)
+        self.assertEqual(len(cleaned), len(code))
+        self.assertEqual(cleaned.count("\n"), code.count("\n"))
+        return cleaned
+
+    def test_java_text_block_line_continuation(self):
+        # Regression: a trailing '\' in a text block swallowed the newline,
+        # leaving the cleaned source one line short (IndexError in analysis).
+        code = (
+            "class A {\n"
+            '    String s = """\n'
+            "        first \\\n"
+            "        second \\\n"
+            '        """;\n'
+            "    void f(int x) {\n"
+            "        if (x > 0) { return; }\n"
+            "    }\n"
+            "}"
+        )
+        self.assert_same_lines(code, "java")
+        cc, _, _ = analyze(code, lang="java")
+        self.assertEqual(cc, 2)
+
+    def test_java_text_block_with_quotes_hides_keywords(self):
+        code = (
+            "class B {\n"
+            '    String s = """\n'
+            '        He said "if (a) { while (b) {" and left\n'
+            '        """;\n'
+            "    void f(int x) {\n"
+            "        if (x > 0) { return; }\n"
+            "    }\n"
+            "}"
+        )
+        cleaned = self.assert_same_lines(code, "java")
+        self.assertNotIn("while", cleaned)
+        cc, _, nest = analyze(code, lang="java")
+        self.assertEqual(cc, 2, "only the real if counts")
+        self.assertEqual(nest, 3, "class + method + if: braces inside the text block are ignored")
+
+    def test_escaped_newline_in_js_string(self):
+        code = "const s = 'a\\\nb';\nif (x) { y(); }\n"
+        self.assert_same_lines(code, "js")
+        cc, _, _ = analyze(code, lang="js")
+        self.assertEqual(cc, 2)
+
+    def test_csharp_verbatim_string_trailing_backslash(self):
+        code = 'var p = @"C:\\temp\\";\nif (x) { y(); }\n'
+        cleaned = self.assert_same_lines(code, "cs")
+        self.assertIn("if (x)", cleaned, "string must close at the quote")
+
+    def test_csharp_verbatim_doubled_quote(self):
+        code = 'var s = @"say ""if (a)"" now";\nif (x) { y(); }\n'
+        cc, _, _ = analyze(code, lang="cs")
+        self.assertEqual(cc, 2)
+
+    def test_csharp_raw_string_literal(self):
+        code = 'var s = """\n  {"if (a)": 1}\n  """;\nif (x) { y(); }\n'
+        self.assert_same_lines(code, "cs")
+        cc, _, nest = analyze(code, lang="cs")
+        self.assertEqual((cc, nest), (2, 1))
+
+    def test_kotlin_raw_string(self):
+        code = 'val s = """\n  if (a) { "x" }\n"""\nif (x) { y() }\n'
+        cc, _, _ = analyze(code, lang="kotlin")
+        self.assertEqual(cc, 2)
+
+    def test_go_raw_string(self):
+        code = 'q := `SELECT "if (a)"\nFROM t`\nif x > 0 {\n}\n'
+        cleaned = self.assert_same_lines(code, "go")
+        self.assertNotIn("SELECT", cleaned)
+
+    def test_stray_quote_does_not_swallow_following_lines(self):
+        # Rust lifetime: a single ' must not hide the code below it
+        code = "struct S<'a> {\n  x: &str,\n}\nfn f(x: i32) {\n  if x > 0 { }\n}\n"
+        cleaned = self.assert_same_lines(code, "rust")
+        self.assertIn("if x > 0", cleaned)
+
+    def test_js_template_expression_is_code(self):
+        code = "const s = `a ${ok ? 'y' : 'n'} b { if (z) }`;\n"
+        cleaned = self.assert_same_lines(code, "js")
+        self.assertIn("ok ?", cleaned)
+        self.assertNotIn("if (z)", cleaned)
+        cc, _, nest = analyze(code, lang="js")
+        self.assertEqual((cc, nest), (2, 0), "ternary inside ${} counts; template braces do not")
+
+    def test_js_nested_template_literals(self):
+        code = "const s = `x ${c ? `<p>${d}</p>` : ''} y`;\nif (q) { w(); }\n"
+        cleaned = self.assert_same_lines(code, "js")
+        self.assertNotIn("<p>", cleaned)
+        self.assertIn("if (q)", cleaned)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  FUNCTION DETECTION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def count_functions(code: str, lang: str):
+    fm = FileMetrics("__test__", lang)
+    return _analyze_cstyle(code, fm).functions
+
+
+class TestFunctionDetection(unittest.TestCase):
+
+    def test_js_control_flow_is_not_a_function(self):
+        code = (
+            "function f(id) {\n"
+            "  if (id > 0) {\n"
+            "  } else if (id < 0) {\n"
+            "  }\n"
+            "  for (const x of xs) {\n"
+            "  }\n"
+            "  try { a(); } catch (e) {\n"
+            "  }\n"
+            "}\n"
+        )
+        self.assertEqual(count_functions(code, "js"), 1)
+        self.assertEqual([n for n, _, _ in _find_function_boundaries(code, "js")], ["f"])
+
+    def test_js_method_and_arrow_still_counted(self):
+        code = "class A {\n  load(id) {\n  }\n}\nconst g = (x) => x;\n"
+        self.assertEqual(count_functions(code, "js"), 2)
+
+    def test_java_package_private_method(self):
+        code = "class T {\n  void shouldWork() {\n  }\n  static int helper(int a) {\n  }\n}\n"
+        self.assertEqual(count_functions(code, "java"), 2)
+
+    def test_java_statements_are_not_functions(self):
+        code = (
+            "class T {\n"
+            "  public void f() {\n"
+            "    return compute(a,\n"
+            "        b);\n"
+            "    String s = format(x);\n"
+            "    Runnable r = new Runnable() {\n"
+            "    };\n"
+            "    } else if (x) {\n"
+            "  }\n"
+            "  abstract void g();\n"
+            "}\n"
+        )
+        self.assertEqual(count_functions(code, "java"), 1)
+
+    def test_c_prototype_is_not_a_definition(self):
+        code = "int add(int a, int b);\nint add(int a, int b) {\n  return a + b;\n}\n"
+        self.assertEqual(count_functions(code, "c"), 1)
+
+    def test_objc_methods(self):
+        code = (
+            "@implementation Foo\n"
+            "- (void)load:(int)x {\n"
+            "  if (x) { }\n"
+            "}\n"
+            "+ (instancetype)shared {\n"
+            "}\n"
+            "@end\n"
+        )
+        self.assertEqual(count_functions(code, "objc"), 2)
+        self.assertEqual([n for n, _, _ in _find_function_boundaries(code, "objc")], ["load", "shared"])
+
+    def test_groovy_def_counted_dsl_blocks_not(self):
+        code = (
+            "def build(String target) {\n"
+            "}\n"
+            "pipeline {\n"
+            "  stages {\n"
+            "    stage('Build') {\n"
+            "      steps { echo 'hi' }\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        self.assertEqual(count_functions(code, "groovy"), 1)
+
+    def test_braces_in_strings_do_not_break_boundaries(self):
+        code = "function f() {\n  const s = '}';\n  if (a) { b(); }\n}\nfunction g() {\n}\n"
+        self.assertEqual(
+            [(n, s, e) for n, s, e in _find_function_boundaries(code, "js")],
+            [("f", 0, 3), ("g", 4, 5)],
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  VUE / SVELTE AND NEW FILE TYPES
+# ═══════════════════════════════════════════════════════════════════════════
+
+VUE_SAMPLE = """<template>
+  <div class="wrapper">
+    <ul v-if="items.length && !loading">
+      <li v-for="item in items" :key="item.id">{{ item.ok ? 'yes' : 'no' }}</li>
+    </ul>
+  </div>
+</template>
+
+<script setup lang="ts">
+function load(id: number) {
+  if (id > 0) {
+    console.log('loading', id)
+  }
+}
+</script>
+
+<style scoped>
+@media (max-width: 600px) {
+  .wrapper { padding: 0; }
+}
+</style>
+"""
+
+
+class TestSingleFileComponents(unittest.TestCase):
+
+    def test_extract_keeps_only_script_and_line_numbers(self):
+        out = _extract_sfc_script(VUE_SAMPLE)
+        self.assertEqual(out.count("\n"), VUE_SAMPLE.count("\n"))
+        self.assertNotIn("v-if", out)
+        self.assertNotIn("@media", out)
+        self.assertEqual(out.split("\n")[9], "function load(id: number) {")
+
+    def test_multiple_script_blocks_and_src(self):
+        sfc = (
+            '<script src="./a.ts"></script>\n'
+            "<script>\nexport default { name: 'A' }\n</script>\n"
+            '<script setup lang="ts">\nconst x = 1\n</script>\n'
+        )
+        out = _extract_sfc_script(sfc)
+        self.assertIn("export default", out)
+        self.assertIn("const x = 1", out)
+        self.assertEqual(out.count("\n"), sfc.count("\n"))
+
+    def _write(self, tmp, name, text):
+        import os
+        path = os.path.join(tmp, name)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def test_vue_file_metrics_ignore_template_and_style(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            fm = analyze_file(self._write(tmp, "Sample.vue", VUE_SAMPLE), "Sample.vue")
+        self.assertEqual(fm.lang, "vue")
+        self.assertEqual(fm.total_lines, VUE_SAMPLE.count("\n") + 1)
+        self.assertEqual(fm.code_lines, 5, "script code lines only")
+        self.assertEqual((fm.cyclomatic, fm.functions), (2, 1))
+        self.assertEqual([(f.name, f.start_line) for f in fm.function_metrics], [("load", 10)])
+
+    def test_svelte_file(self):
+        import tempfile
+        src = "<script>\n  let n = 0;\n  function inc() { if (n < 5) n++; }\n</script>\n{#if n > 2}<p>{n}</p>{/if}\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            fm = analyze_file(self._write(tmp, "C.svelte", src), "C.svelte")
+        self.assertEqual((fm.lang, fm.cyclomatic, fm.functions), ("svelte", 2, 1))
+
+    def test_detect_lang_new_types(self):
+        cases = {
+            "a.mts": "js", "a.cts": "js", "A.vue": "vue", "A.svelte": "svelte",
+            "a.m": "objc", "a.mm": "objc", "a.groovy": "groovy",
+            "build.gradle": "groovy", "Jenkinsfile": "groovy",
+        }
+        for path, lang in cases.items():
+            self.assertEqual(_detect_lang(path), lang, path)
+
+    def test_matlab_m_file_is_skipped(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            matlab = self._write(tmp, "calc.m", "function y = calc(x)\n  % comment\n  y = x * 2;\nend\n")
+            objc = self._write(tmp, "Foo.m", '#import "Foo.h"\n@implementation Foo\n@end\n')
+            self.assertIsNone(analyze_file(matlab, "calc.m"))
+            self.assertEqual(analyze_file(objc, "Foo.m").lang, "objc")
+
+    def test_scan_project_finds_new_types(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write(tmp, "Sample.vue", VUE_SAMPLE)
+            self._write(tmp, "Jenkinsfile", "pipeline {\n  agent any\n}\n")
+            self._write(tmp, "build.gradle", "plugins { id 'java' }\n")
+            self._write(tmp, "util.mts", "export const a = 1;\n")
+            self._write(tmp, "calc.m", "x = 1;\n")  # MATLAB: skipped
+            paths = sorted(m.path for m in scan_project(tmp))
+        self.assertEqual(paths, ["Jenkinsfile", "Sample.vue", "build.gradle", "util.mts"])
+
+    def test_logging_scans_vue_script_only(self):
+        import tempfile
+        import logging_analysis as la
+        sfc = VUE_SAMPLE.replace("</template>", "  <!-- console.log('not code') -->\n</template>")
+        with tempfile.TemporaryDirectory() as tmp:
+            fm = la.analyze_file(self._write(tmp, "Sample.vue", sfc), "Sample.vue")
+        self.assertEqual((fm.lang, fm.active_log_lines), ("vue", 1))
+        self.assertEqual(fm.log_line_details[0][0], 13, "reported at its real line number")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  FIXES VERIFIED AGAINST ROSLYN (C# compiler syntax tree)
+#  See tools/roslyn_check/ for the reference implementation and comparison.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def metrics(code: str, lang: str = "cs"):
+    """(cyclomatic, cognitive) of a snippet analyzed as a file."""
+    fm = _analyze_cstyle(code, FileMetrics("__test__", lang))
+    return fm.cyclomatic, fm.cognitive
+
+
+def functions(code: str, lang: str = "cs"):
+    """[(name, 1-based start line, cyclomatic, cognitive), ...]"""
+    return [(f.name, f.start_line, f.cyclomatic, f.cognitive)
+            for f in _analyze_functions(code, "__test__", lang)]
+
+
+class TestTernaryDetection(unittest.TestCase):
+
+    def test_member_access_in_branches(self):
+        self.assertEqual(metrics("var x = a != null ? a.Name : b.Name;")[0], 2)
+
+    def test_multi_line_ternary(self):
+        self.assertEqual(metrics("var x = cond\n    ? a.B\n    : c.D;")[0], 2)
+
+    def test_nullable_types_are_not_ternaries(self):
+        code = "class C {\n  public C(string? name) : base(name) {\n  }\n  int? Foo(Action<int, DateTime?> a) { return null; }\n}"
+        self.assertEqual(metrics(code)[0], 1)
+
+    def test_typescript_optional_members_are_not_ternaries(self):
+        self.assertEqual(metrics("interface P {\n  name?: string;\n  age?: number;\n}", "js")[0], 1)
+
+    def test_java_wildcard_is_not_ternary(self):
+        self.assertEqual(metrics("for (Class<?> k : klasses) {\n}", "java")[0], 2)
+
+    def test_null_conditional_and_coalescing_are_not_ternaries(self):
+        self.assertEqual(metrics("var n = a?.b ?? c;")[0], 2, "only ?? counts")
+
+    def test_nested_multi_line_ternary_nests(self):
+        code = "int F() {\n  return a\n    ? b\n      ? 1\n      : 2\n    : 3;\n}"
+        self.assertEqual(metrics(code)[1], 3, "outer +1, inner +2")
+
+
+class TestCatchDetection(unittest.TestCase):
+
+    def test_bare_catch_counts(self):
+        self.assertEqual(metrics("try {\n  a();\n}\ncatch\n{\n}")[0], 2)
+
+    def test_promise_catch_call_does_not_count(self):
+        self.assertEqual(metrics("fetch(u).then(r => r.json()).catch(e => log(e));", "js")[0], 1)
+
+
+class TestParenlessConditions(unittest.TestCase):
+
+    def test_go(self):
+        code = "func f(x int) {\n  if x > 0 {\n  } else if x < 0 {\n  }\n  for i := range xs {\n  }\n}"
+        cc, cog = metrics(code, "go")
+        self.assertEqual(cc, 4, "if, else if, for")
+        self.assertEqual(cog, 3, "if +1, else if +1, for +1")
+
+    def test_rust(self):
+        code = "fn f(x: i32) {\n  if x > 0 {\n  }\n  while let Some(v) = it.next() {\n  }\n}"
+        self.assertEqual(metrics(code, "rust")[0], 3)
+
+    def test_swift_guard_else_is_not_a_branch(self):
+        code = "func f(x: Int?) {\n  guard let v = x else {\n    return\n  }\n  if v > 0 {\n  }\n}"
+        cc, cog = metrics(code, "swift")
+        self.assertEqual(cc, 3, "guard, if")
+        self.assertEqual(cog, 2, "guard +1, if +1; the guard's else adds nothing")
+
+
+class TestCognitiveNestingRoles(unittest.TestCase):
+    """Only control-flow braces (and nested lambdas/functions) nest."""
+
+    def test_method_body_does_not_nest(self):
+        code = "class C {\n  public void F() {\n    if (a) {\n      x();\n    }\n  }\n}"
+        self.assertEqual(metrics(code)[1], 1)
+        self.assertEqual(functions(code)[0][3], 1)
+
+    def test_allman_braces(self):
+        code = ("namespace N\n{\n  class C\n  {\n    void F()\n    {\n      for (;;)\n      {\n"
+                "        if (a)\n        {\n        }\n      }\n    }\n  }\n}")
+        self.assertEqual(metrics(code)[1], 3, "for +1, if +2")
+
+    def test_using_lock_try_and_initializers_do_not_nest(self):
+        code = ("void F() {\n  using (var s = Open()) {\n    lock (o) {\n      try {\n"
+                "        var p = new P {\n          A = b ? 1 : 2\n        };\n      }\n"
+                "      finally {\n      }\n    }\n  }\n}")
+        self.assertEqual(metrics(code)[1], 1, "ternary at nesting 0")
+
+    def test_lambda_inside_method_nests(self):
+        code = "void F() {\n  items.ForEach(x => {\n    if (x) {\n    }\n  });\n}"
+        self.assertEqual(metrics(code)[1], 2)
+
+    def test_expression_lambda_nests(self):
+        self.assertEqual(metrics("void F() {\n  var q = xs.Select(x => x.A ? 1 : 2);\n}")[1], 2)
+
+    def test_case_then_if_on_allman_brace(self):
+        code = ("void F() {\n  switch (k) {\n    case 1:\n      if (a)\n      {\n"
+                "        for (;;) { }\n      }\n      break;\n  }\n}")
+        self.assertEqual(metrics(code)[1], 6, "switch +1, if +2, for +3")
+
+    def test_property_pattern_on_if_line(self):
+        code = "void F() {\n  if (o is { A: 1 })\n  {\n    if (b)\n    {\n    }\n  }\n}"
+        self.assertEqual(metrics(code)[1], 3, "if +1, nested if +2")
+
+
+class TestBracelessBodies(unittest.TestCase):
+
+    def test_for_then_if_without_braces(self):
+        code = "void F() {\n  for (int k = 0; k < n; k++)\n    if (a[k])\n    {\n      b();\n    }\n  if (c) { }\n}"
+        self.assertEqual(metrics(code)[1], 4, "for +1, nested if +2, later if +1")
+
+    def test_else_newline_if_is_else_if(self):
+        code = "void F() {\n  if (a)\n    x();\n  else\n    if (b)\n      y();\n}"
+        self.assertEqual(metrics(code)[1], 2, "if +1, else-if +1")
+
+
+class TestMultiLineLogicalSequences(unittest.TestCase):
+
+    def test_sequence_continues_over_lines(self):
+        code = "bool F() {\n  return a\n    || b\n    || c\n    || d;\n}"
+        self.assertEqual(metrics(code)[1], 1)
+
+    def test_separate_lambdas_are_separate_sequences(self):
+        code = "var q = xs\n  .Where(x => x.A || x.B)\n  .Where(x => x.C || x.D);"
+        self.assertEqual(metrics(code)[1], 2)
+
+
+class TestCSharpSwitchAndWhen(unittest.TestCase):
+
+    def test_switch_expression(self):
+        code = ("decimal D(Order o) {\n  return o.Status switch\n  {\n    S.New => 0m,\n"
+                "    S.Paid when o.Amount > 1000 => 0.1m,\n    _ when o.Vip => 0.2m,\n    _ => 0.05m,\n  };\n}")
+        cc, cog = metrics(code)
+        self.assertEqual(cc, 1 + 2 + 2, "2 non-discard arms + 2 guards")
+        self.assertEqual(cog, 1)
+
+    def test_guard_on_line_above_arrow(self):
+        code = "var m = a switch\n{\n  Cat c when c.Legs == 4\n    => 1,\n  _\n    => 2,\n};"
+        self.assertEqual(metrics(code)[0], 3, "1 arm + 1 guard")
+
+    def test_case_guard_and_catch_filter(self):
+        code = ("switch (x) {\n  case int i when i > 0:\n    break;\n}\n"
+                "try { } catch (E e) when (e.Code == 1) { }")
+        self.assertEqual(metrics(code)[0], 1 + 2 + 2, "case + guard, catch + filter")
+
+    def test_when_as_identifier_does_not_count(self):
+        code = "void F(DateTime when) {\n  T(when: when);\n  if (when < now) { }\n}"
+        self.assertEqual(metrics(code)[0], 2)
+
+    def test_goto_case_does_not_count(self):
+        code = "switch (x) {\n  case 1:\n    break;\n  case 2:\n    goto case 1;\n}"
+        self.assertEqual(metrics(code)[0], 3)
+
+    def test_interpolation_holes_are_code(self):
+        self.assertEqual(metrics('var s = $"{(a ? "x" : "y")} {{literal ? }}";')[0], 2)
+
+
+class TestCSharpFunctionDetection(unittest.TestCase):
+
+    def names(self, code):
+        return [f[0] for f in functions(code)]
+
+    def test_methods_without_modifier_generic_and_destructor(self):
+        code = ("class C\n{\n  void Reset()\n  {\n  }\n  public T First<T>(IEnumerable<T> xs) where T : class\n  {\n"
+                "    return default;\n  }\n  ~C()\n  {\n  }\n  public static C operator +(C a, C b)\n  {\n    return a;\n  }\n}")
+        self.assertEqual(self.names(code), ["Reset", "First", "C", "operator+"])
+
+    def test_expression_bodied_member_does_not_take_next_body(self):
+        code = ("class C\n{\n  public int A() =>\n    1;\n  protected override void B(X x)\n"
+                "    => x.Do();\n  public int Next()\n  {\n    if (a) { }\n    return 1;\n  }\n}")
+        self.assertEqual(functions(code), [("Next", 7, 2, 1)])
+
+    def test_primary_constructor_is_not_a_function(self):
+        code = "public class Ex(string id) : Exception($\"{id}\")\n{\n}\npublic record R(int A) { }"
+        self.assertEqual(functions(code), [])
+
+    def test_accessors_with_block_bodies(self):
+        code = ("class C\n{\n  public int Count\n  {\n    get { return _c > 0 ? _c : 0; }\n    private set\n"
+                "    {\n      if (value < 0) throw new X();\n      _c = value;\n    }\n  }\n  public int Auto { get; set; }\n}")
+        self.assertEqual(functions(code), [("Count.get", 5, 2, 1), ("Count.set", 6, 2, 1)])
+
+    def test_statements_are_not_functions(self):
+        code = ("class C\n{\n  public async Task F()\n  {\n    await Task.WhenAll(a,\n      b);\n"
+                "    return Compute(a,\n      b);\n  }\n}")
+        self.assertEqual(self.names(code), ["F"])
+
+
+class TestJsArrowFunctions(unittest.TestCase):
+
+    def test_expression_bodied_arrow_ends_with_its_statement(self):
+        code = ("const half = (x: number) =>\n  x > 0\n    ? x / 2\n    : 0;\n"
+                "function next() {\n  if (a) { b(); }\n}")
+        self.assertEqual(
+            [(n, s, e) for n, s, e in _find_function_boundaries(code, "js")],
+            [("half", 0, 3), ("next", 4, 6)],
+        )
+
+
+class TestCSharpRoslynFixture(unittest.TestCase):
+    """test_fixtures/csharp/OrderService.cs against values computed by Roslyn
+    (tools/roslyn_check/Oracle.cs, expected values in OrderService.expected.json)."""
+
+    def test_matches_roslyn(self):
+        import json
+        import os
+        here = os.path.dirname(os.path.abspath(__file__))
+        src = os.path.join(here, "test_fixtures", "csharp", "OrderService.cs")
+        with open(os.path.join(here, "test_fixtures", "csharp", "OrderService.expected.json")) as f:
+            expected = json.load(f)
+        fm = analyze_file(src, "OrderService.cs")
+        self.assertEqual(fm.cyclomatic, expected["file_cyclomatic"])
+        got = {f.start_line: (f.cyclomatic, f.cognitive) for f in fm.function_metrics}
+        for e in expected["functions"]:
+            with self.subTest(function=e["name"], line=e["line"]):
+                self.assertIn(e["line"], got, "function not detected")
+                self.assertEqual(got[e["line"]], (e["cyclomatic"], e["cognitive"]))
+        self.assertEqual(len(got), len(expected["functions"]), "no extra functions")
 
 
 # ─── Run ────────────────────────────────────────────────────────────────────

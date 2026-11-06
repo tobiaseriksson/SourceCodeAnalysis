@@ -98,13 +98,19 @@ from pathlib import Path
 
 EXTENSIONS = {
     # TypeScript / JavaScript
-    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts",
+    # Single-file components (only the <script> blocks are analyzed)
+    ".vue", ".svelte",
     # C#
     ".cs",
     # Java
     ".java",
     # C / C++
     ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx",
+    # Objective-C (.m is only analyzed if it looks like Objective-C, not MATLAB)
+    ".m", ".mm",
+    # Groovy / Gradle
+    ".groovy", ".gradle",
     # Go
     ".go",
     # Rust
@@ -128,6 +134,8 @@ EXTENSIONS = {
     # HTML / Razor
     ".html", ".htm", ".cshtml", ".razor",
 }
+# Extensionless files recognised by exact name
+FILENAME_LANGS = {"Jenkinsfile": "groovy"}
 SKIP_DIRS = {
     "node_modules", ".git", "dist", "build", ".next", ".nuxt",
     ".lovable", ".gemini", ".vscode", ".idea", "coverage", "__pycache__",
@@ -137,7 +145,11 @@ SKIP_DIRS = {
 SKIP_SUFFIXES = {".d.ts", ".min.js", ".bundle.js", ".Designer.cs", ".g.cs", ".g.i.cs"}
 
 # Language families
-LANG_JS = {"js", "jsx", "ts", "tsx", "mjs", "cjs"}
+LANG_JS = {"js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"}
+LANG_VUE = {"vue"}
+LANG_SVELTE = {"svelte"}
+LANG_OBJC = {"m", "mm"}
+LANG_GROOVY = {"groovy", "gradle"}
 LANG_CSHARP = {"cs"}
 LANG_JAVA = {"java"}
 LANG_C = {"c", "h"}
@@ -156,7 +168,12 @@ LANG_HTML = {"html", "htm", "cshtml", "razor"}
 # All languages that use C-style // and /* */ comments and brace-delimited blocks
 LANG_CSTYLE = (LANG_JS | LANG_CSHARP | LANG_JAVA | LANG_C | LANG_CPP |
                LANG_GO | LANG_RUST | LANG_KOTLIN | LANG_SWIFT | LANG_DART |
-               LANG_SCALA | LANG_PHP)
+               LANG_SCALA | LANG_PHP | LANG_VUE | LANG_SVELTE | LANG_OBJC |
+               LANG_GROOVY)
+
+# Single-file component languages: the <script> blocks are extracted and
+# analyzed as JS/TS; <template>/<style> are ignored (same as SonarJS).
+SFC_LANGS = {"vue", "svelte"}
 
 # Thresholds for *per-file* aggregate scores (whole-file CC/Cog sums).
 #
@@ -265,12 +282,27 @@ class FunctionMetrics:
 
 # ─── Function/method detection patterns ────────────────────────────────────
 
-# C#: method declarations (access modifier + return type + name + parens)
+# C#: method / constructor / destructor / operator declarations. Either modifiers
+# (return type optional: constructors) or a return type is required, so plain calls
+# like `Foo(x)` do not match. Methods without a modifier (private by default),
+# generic methods `Name<T>(`, explicit interface implementations `IFoo.Bar(` and
+# tuple return types are covered. Statements that still match (`return Foo(a,`,
+# `await Task.WhenAll(`...) are rejected in _match_function_decl.
+_CS_MODIFIERS = (r"(?:public|private|protected|internal|static|virtual|override|abstract|"
+                 r"async|sealed|partial|new|extern|unsafe|readonly|required|file)")
+_CS_TYPE = r"(?:\w[\w<>\[\],.\s?]*|\([^()]*\)\??)"
 _FUNC_CS = re.compile(
-    r"^\s*(?:public|private|protected|internal|static|virtual|override|abstract|async|sealed|partial|new|extern|\s)*"
-    r"\s+(?:\w[\w<>\[\],\s\?]*\s+)?\w+\s*\("
-    r"(?!.*;\s*$)"   # exclude interface method declarations (end with ;)
+    r"^\s*(?:(?:" + _CS_MODIFIERS + r"\s+)+(?:" + _CS_TYPE + r"\s+)?|" + _CS_TYPE + r"\s+)"
+    r"(?:[\w.]+\.)?\w+\s*(?:<[^()]*>)?\s*\("
+    r"|^\s*~\w+\s*\("                                    # destructor
+    r"|\boperator\s*(?:[^\s\w(]+|true|false)\s*\("      # operator +( / operator ==(
 )
+# C# property/indexer/event accessor with a block body:  get {  /  private set  (Allman)
+_CS_ACCESSOR = re.compile(
+    r"^(?:(?:public|private|protected|internal|readonly)\s+)*(get|set|init|add|remove)\s*(?:\{|$)")
+# C# property / indexer / event declaration (no parameter list): its name labels accessors
+_CS_PROPERTY = re.compile(
+    r"^(?:[\w<>\[\],.?]+\s+)+(\w+|this\s*\[[^\]]*\])\s*(?:\{.*)?$")
 # JS/TS: function declarations, arrow functions, class methods
 _FUNC_JS = re.compile(
     r"(?:"
@@ -280,10 +312,12 @@ _FUNC_JS = re.compile(
     r"(?:const|let|var)\s+\w+\s*=\s*(?:async\s+)?\([^)]*\)\s*=>"     # const x = (...) =>
     r")",
 )
-# Java: method declarations
+# Java: method declarations (modifiers optional: package-private methods such as
+# JUnit 5 `void shouldX() {` have none). Calls/statements are rejected in
+# _is_function_decl (trailing ';', control keywords, `return foo(`...).
 _FUNC_JAVA = re.compile(
-    r"^\s*(?:public|private|protected|static|final|abstract|synchronized|native|\s)*"
-    r"\s+\w[\w<>\[\],\s\?]*\s+\w+\s*\(",
+    r"^\s*(?:(?:public|private|protected|static|final|abstract|synchronized|native|default)\s+)*"
+    r"\w[\w<>\[\],\s\?]*\s+\w+\s*\(",
 )
 # C/C++: function definitions (return type + name + parens + opening brace nearby)
 _FUNC_C = re.compile(
@@ -333,6 +367,46 @@ _FUNC_DART = re.compile(
 _FUNC_SCALA = re.compile(
     r"^\s*(?:override\s+)?(?:private|protected)?\s*def\s+\w+",
 )
+# Objective-C: C functions plus methods such as  - (void)load:(int)x {
+_FUNC_OBJC_METHOD = re.compile(r"^\s*[-+]\s*\([^)]*\)\s*(\w+)")
+_FUNC_OBJC = re.compile(_FUNC_C.pattern + r"|" + _FUNC_OBJC_METHOD.pattern)
+# Groovy: `def name(...) {` or Java-style `Type name(...) {`. Requiring a type/def
+# and the brace keeps DSL calls such as `stage('Build') {` from counting.
+_FUNC_GROOVY = re.compile(
+    r"^\s*(?:(?:public|private|protected|static|final|abstract|synchronized)\s+)*"
+    r"(?:def|[\w<>\[\],?]+)\s+\w+\s*\([^)]*\)\s*\{",
+)
+
+# Function-detection pattern per language key
+_FUNC_PATTERNS = {
+    "cs": _FUNC_CS, "js": _FUNC_JS, "java": _FUNC_JAVA,
+    "c": _FUNC_C, "cpp": _FUNC_C, "go": _FUNC_GO, "rust": _FUNC_RUST,
+    "kotlin": _FUNC_KOTLIN, "php": _FUNC_PHP, "swift": _FUNC_SWIFT,
+    "dart": _FUNC_DART, "scala": _FUNC_SCALA,
+    "vue": _FUNC_JS, "svelte": _FUNC_JS, "objc": _FUNC_OBJC, "groovy": _FUNC_GROOVY,
+}
+
+# A line that the function pattern matches is NOT a function declaration when the
+# identifier before '(' is a control-flow keyword (`if (x) {`, `} else if (`,
+# `for (...) {`, `catch (e) {`, ...).
+_CONTROL_KEYWORDS = {
+    "if", "else", "elif", "for", "foreach", "while", "do", "switch", "catch",
+    "using", "lock", "fixed", "synchronized", "when", "with", "return", "throw",
+    "sizeof", "typeof", "nameof", "checked", "unchecked", "await",
+}
+# Word directly before the name that shows the line is a statement (or a type
+# declaration such as a C# 12 primary constructor `class Foo(int x)`), not a function
+_NOT_DECL_PREV_WORDS = {
+    "new", "return", "throw", "yield", "case", "await", "else", "goto",
+    "class", "struct", "record", "interface", "enum",
+    # LINQ query clauses
+    "where", "select", "from", "in", "let", "join", "on", "equals", "orderby", "group", "by", "into",
+}
+# Leading attributes / annotations before a declaration:  [HttpGet] ...  /  @Override ...
+_RE_LEADING_ATTRS = re.compile(r"^(?:\[[^\]]*\]\s*|@(?!interface\b|implementation\b|end\b)\w+(?:\.\w+)*(?:\([^)]*\))?\s+)+")
+# Languages where a matching line ending in ';' is a prototype, abstract/interface
+# declaration or a call statement rather than a function definition.
+_SEMICOLON_NOT_DECL_LANGS = {"java", "c", "cpp", "objc", "cs", "groovy"}
 
 
 # ─── Complexity patterns per language ──────────────────────────────────────
@@ -372,6 +446,14 @@ def _get_lang(ext: str) -> str:
         return "py"
     if ext in LANG_HTML:
         return "html"
+    if ext in LANG_VUE:
+        return "vue"
+    if ext in LANG_SVELTE:
+        return "svelte"
+    if ext in LANG_OBJC:
+        return "objc"
+    if ext in LANG_GROOVY:
+        return "groovy"
     return "unknown"
 
 
@@ -383,10 +465,17 @@ def _get_lang(ext: str) -> str:
 #   Note: \bif\s*\( already matches the 'if' inside 'else if',
 #   so 'else if' must NOT be listed separately (would double-count).
 #
+#   Ternary: a `?` with whitespace (or line start/end) on both sides. This skips
+#   nullable types (`string? x`), TS optional members (`a?: T`), `?.`, `??`, `?:`,
+#   Java wildcards (`<?>`) and Rust's `?` operator, and counts multi-line ternaries.
+#
 #   Language-specific CC notes:
 #   - Python: `if` in `x if cond else y` is not a separate decision; ternary is one pattern.
+#   - Go / Rust / Swift: `if`, `for`, `while` take no parentheses (`if x > 0 {`).
 #   - Rust: each `=>` arm in match counts (like C switch `case`), not the `match` keyword.
-#   - Go: `for { ... }` (no parentheses) is counted as a loop decision.
+#   - C#: `when` (exception filters and case/switch-arm guards) counts, and so does
+#     each non-discard arm of a switch expression (`x switch { A => .., _ => .. }`),
+#     like a `case` label.
 #
 # Cognitive Complexity (SonarSource, 2023):
 #   Four increment categories (per the official white paper):
@@ -416,17 +505,26 @@ def _get_lang(ext: str) -> str:
 #     if, else, else if, ternary, switch, for, while, do-while,
 #     foreach, catch, nested lambdas/functions (but lambdas get no
 #     increment themselves — they only increase nesting).
+#   It does NOT increase for the function's own body, class/namespace/struct,
+#   try/finally, using/lock, object initializers or property accessors: a
+#   brace's role is taken from the code before it (or from the previous lines,
+#   for a brace on its own line).
 #
+
+# Ternary `?`: whitespace (or line start/end) on both sides
+_RE_TERNARY = re.compile(r"(?:(?<=\s)|^)\?(?=\s|$)")
+# catch, with or without a parameter list; not a promise.catch(...) call
+_RE_CATCH = re.compile(r"(?<!\.)\bcatch\b")
 
 _CC_COMMON = [
     re.compile(r"\bif\s*\("),          # matches both 'if' and 'else if'
     re.compile(r"\bwhile\s*\("),
     re.compile(r"\bfor\s*\("),
-    re.compile(r"\bcase\s+"),
-    re.compile(r"\bcatch\s*\("),
+    re.compile(r"(?<!\bgoto\s)\bcase\s+"),   # not C#'s  goto case X;
+    _RE_CATCH,
     re.compile(r"&&"),
     re.compile(r"\|\|"),
-    re.compile(r"\?[^?.:]*:"),         # ternary  ?x:y
+    _RE_TERNARY,
 ]
 
 # Cognitive: structural patterns → +1 + nesting_level
@@ -437,8 +535,8 @@ _COG_STRUCT_COMMON = [
     re.compile(r"\bwhile\s*\("),
     re.compile(r"\bfor\s*\("),
     re.compile(r"\bswitch\s*\("),
-    re.compile(r"\bcatch\s*\("),              # catch is structural per spec
-    re.compile(r"\?[^?.:]*:"),               # ternary operator is structural
+    _RE_CATCH,                                # catch is structural per spec
+    _RE_TERNARY,                              # ternary operator is structural
 ]
 
 # Cognitive: hybrid patterns → +1 only (no nesting penalty)
@@ -461,11 +559,19 @@ _COG_HYBRID_JS_EXTRA = []
 _CC_CS_EXTRA = [
     re.compile(r"\bforeach\s*\("),
     re.compile(r"\?\?(?!=)"),          # null coalescing
-    re.compile(r"\bwhen\s*\("),        # exception filter (C# 6+)
+    # `when` as exception filter / guard, not as an identifier (`DateTime when`):
+    re.compile(r"\bwhen\s*\("),                          # catch (E e) when (...)  /  case X when (...)
+    re.compile(r"^case\b.*?\bwhen\b(?!\s*\()"),           # case int x when x > 0:
+    re.compile(r"(?<!\.)\bwhen\b(?!\s*[(:,)=])(?=.*=>)"),   # switch arm:  A when cond =>
+    # (switch-expression arms are counted by the analyzer, which knows the context)
 ]
+
+# Switch expression:  x switch { ... }  (a switch statement is  switch (x) )
+_RE_CS_SWITCH_EXPR = re.compile(r"\bswitch\b(?!\s*\()")
 
 _COG_STRUCT_CS_EXTRA = [
     re.compile(r"\bforeach\s*\("),
+    _RE_CS_SWITCH_EXPR,
 ]
 
 _COG_HYBRID_CS_EXTRA = []
@@ -484,28 +590,43 @@ _CC_C_EXTRA = [
 _COG_STRUCT_C_EXTRA = []
 _COG_HYBRID_C_EXTRA = []
 
+# ── Go / Rust / Swift: conditions without parentheses ─────────────────────
+# `if x > 0 {`, `for i := range xs {`, `while let Some(x) = it.next() {`
+_CC_NOPAREN = [
+    re.compile(r"\bif\b"),             # matches both 'if' and 'else if'
+    re.compile(r"\bwhile\b"),
+    re.compile(r"\bfor\b"),
+    re.compile(r"&&"),
+    re.compile(r"\|\|"),
+]
+_COG_STRUCT_NOPAREN = [
+    re.compile(r"(?<!\belse\s)\bif\b"),
+    re.compile(r"\bwhile\b"),
+    re.compile(r"\bfor\b"),
+]
+_COG_HYBRID_NOPAREN = [
+    re.compile(r"\belse\s+if\b"),
+    re.compile(r"\belse\b(?!\s+if)"),
+]
+
 # ── Go extras ──────────────────────────────────────────────────────────────
-# Go uses 'select' for channel operations and 'range' in for loops
 _CC_GO_EXTRA = [
-    re.compile(r"\bselect\s*\{"),
-    re.compile(r"\bfor\s*\{"),  # for { } without C-style (...)
+    re.compile(r"\bcase\b"),           # switch / select cases
 ]
 _COG_STRUCT_GO_EXTRA = [
-    re.compile(r"\bselect\s*\{"),
-    re.compile(r"\bfor\s*\{"),
+    re.compile(r"\bswitch\b"),
+    re.compile(r"\bselect\b"),
 ]
-# Go uses 'else if' like C-style
 _COG_HYBRID_GO_EXTRA = []
 
 # ── Rust extras ────────────────────────────────────────────────────────────
 # Rust: count each match arm (=>) like C switch counts each case; not match keyword
 _CC_RUST_EXTRA = [
-    re.compile(r"\bloop\s*\{"),
+    re.compile(r"\bloop\b"),
     re.compile(r"=>"),
-    re.compile(r"\bif\s+let\b"),
 ]
 _COG_STRUCT_RUST_EXTRA = [
-    re.compile(r"\bloop\s*\{"),
+    re.compile(r"\bloop\b"),
     re.compile(r"\bmatch\b"),
 ]
 _COG_HYBRID_RUST_EXTRA = []
@@ -532,15 +653,24 @@ _COG_HYBRID_PHP_EXTRA = [
 ]
 
 # ── Swift extras ───────────────────────────────────────────────────────────
+# (repeat { } while x  is counted once, by its `while`, like C's do-while)
 _CC_SWIFT_EXTRA = [
     re.compile(r"\bguard\b"),
-    re.compile(r"\brepeat\s*\{"),
+    re.compile(r"\bcase\b"),
+    _RE_CATCH,
+    _RE_TERNARY,
 ]
 _COG_STRUCT_SWIFT_EXTRA = [
     re.compile(r"\bguard\b"),
-    re.compile(r"\brepeat\s*\{"),
+    re.compile(r"\bswitch\b"),
+    _RE_CATCH,
+    _RE_TERNARY,
 ]
-_COG_HYBRID_SWIFT_EXTRA = []
+# A guard's `else` is part of the guard, not a separate branch
+_COG_HYBRID_SWIFT = [
+    re.compile(r"\belse\s+if\b"),
+    re.compile(r"^(?!.*\bguard\b).*?\belse\b(?!\s+if)"),
+]
 
 # ── Dart extras ────────────────────────────────────────────────────────────
 _CC_DART_EXTRA = [
@@ -641,13 +771,20 @@ def _patterns_for(lang: str):
         "java": (_CC_COMMON + _CC_JAVA_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_JAVA_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_JAVA_EXTRA),
         "c": (_CC_COMMON + _CC_C_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_C_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_C_EXTRA),
         "cpp": (_CC_COMMON + _CC_C_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_C_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_C_EXTRA),
-        "go": (_CC_COMMON + _CC_GO_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_GO_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_GO_EXTRA),
-        "rust": (_CC_COMMON + _CC_RUST_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_RUST_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_RUST_EXTRA),
+        "go": (_CC_NOPAREN + _CC_GO_EXTRA, _COG_STRUCT_NOPAREN + _COG_STRUCT_GO_EXTRA, _COG_HYBRID_NOPAREN + _COG_HYBRID_GO_EXTRA),
+        "rust": (_CC_NOPAREN + _CC_RUST_EXTRA, _COG_STRUCT_NOPAREN + _COG_STRUCT_RUST_EXTRA, _COG_HYBRID_NOPAREN + _COG_HYBRID_RUST_EXTRA),
         "kotlin": (_CC_COMMON + _CC_KOTLIN_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_KOTLIN_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_KOTLIN_EXTRA),
         "php": (_CC_COMMON + _CC_PHP_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_PHP_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_PHP_EXTRA),
-        "swift": (_CC_COMMON + _CC_SWIFT_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_SWIFT_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_SWIFT_EXTRA),
+        "swift": (_CC_NOPAREN + _CC_SWIFT_EXTRA, _COG_STRUCT_NOPAREN + _COG_STRUCT_SWIFT_EXTRA, _COG_HYBRID_SWIFT),
         "dart": (_CC_COMMON + _CC_DART_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_DART_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_DART_EXTRA),
         "scala": (_CC_COMMON + _CC_SCALA_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_SCALA_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_SCALA_EXTRA),
+        # Vue / Svelte <script> blocks are JS/TS
+        "vue": (_CC_COMMON + _CC_JS_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_JS_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_JS_EXTRA),
+        "svelte": (_CC_COMMON + _CC_JS_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_JS_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_JS_EXTRA),
+        # Objective-C control flow is C's (@catch is matched by the catch pattern)
+        "objc": (_CC_COMMON + _CC_C_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_C_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_C_EXTRA),
+        # Groovy control flow is Java's
+        "groovy": (_CC_COMMON + _CC_JAVA_EXTRA, _COG_STRUCT_COMMON + _COG_STRUCT_JAVA_EXTRA, _COG_HYBRID_COMMON + _COG_HYBRID_JAVA_EXTRA),
         # Non-brace languages get their own full pattern sets
         "py": (_CC_PYTHON, _COG_STRUCT_PYTHON, _COG_HYBRID_PYTHON),
         "ruby": (_CC_RUBY, _COG_STRUCT_RUBY, _COG_HYBRID_RUBY),
@@ -677,7 +814,7 @@ def _count_operator_sequence_changes(ops: list) -> int:
     return sequences
 
 
-def _count_logical_operator_sequences(stripped: str) -> int:
+def _count_logical_operator_sequences(stripped: str, prev_op: str = None) -> int:
     """Count cognitive increments for logical operator sequences.
 
     Per SonarSource Cognitive Complexity spec:
@@ -691,13 +828,23 @@ def _count_logical_operator_sequences(stripped: str) -> int:
       a && b || c         →  2  (one && seq + one || seq)
       a && b || c && d    →  3  (&&, ||, &&)
       a || b && c || d    →  3  (||, &&, ||)
+
+    prev_op: the last operator of the same expression on the previous line, when
+    the expression continues over lines (a sequence continuing onto this line is
+    not a new sequence).
     """
-    ops = []
-    for m in _RE_LOGICAL_AND.finditer(stripped):
-        ops.append((m.start(), "&&"))
-    for m in _RE_LOGICAL_OR.finditer(stripped):
-        ops.append((m.start(), "||"))
-    return _count_operator_sequence_changes(ops)
+    ops = _logical_ops(stripped)
+    n = _count_operator_sequence_changes(ops)
+    if n and prev_op and ops[0][1] == prev_op:
+        n -= 1
+    return n
+
+
+def _logical_ops(stripped: str) -> list:
+    """[(position, '&&' | '||'), ...] in source order."""
+    ops = [(m.start(), "&&") for m in _RE_LOGICAL_AND.finditer(stripped)]
+    ops += [(m.start(), "||") for m in _RE_LOGICAL_OR.finditer(stripped)]
+    return sorted(ops)
 
 
 def _count_python_keyword_logical_sequences(stripped: str) -> int:
@@ -724,174 +871,376 @@ def _count_ruby_logical_sequences(stripped: str) -> int:
     return _count_operator_sequence_changes(ops)
 
 
-_RE_TRY = re.compile(r"\btry\s*\{")
-_RE_FINALLY = re.compile(r"\bfinally\s*\{")
-_RE_NAMESPACE = re.compile(r"\bnamespace\s+")
-_RE_CLASS_LIKE = re.compile(r"\b(?:class|struct|enum|interface|record)\s+")
+# Brace roles for cognitive nesting (see _brace_kind)
+_RE_NESTING_HEADER_EXTRA = re.compile(r"\b(?:do|repeat)\b")    # do { } while / repeat { } while
+_RE_CASE_HEADER = re.compile(r"^(?:case|default)\b")          # case X: {  /  case A -> {
+_RE_FUNC_KEYWORD_HEADER = re.compile(r"\b(?:function|delegate|func)\b")
+# Lambda arrows per language (C/C++/PHP `->` is member access; Rust/PHP/Scala `=>`
+# are match arms / array keys)
+_LAMBDA_ARROW = {"cs": "=>", "js": "=>", "vue": "=>", "svelte": "=>", "dart": "=>", "java": "->"}
+_RE_TOKENS = re.compile(r"=>|->|[{}();,]")
+# A control header whose body is the next line, without braces:  if (x) / else / for (...)
+_RE_BRACELESS_HEADER = re.compile(r"^(?:else\s+)?(?:if|for|foreach|while|else|do)\b")
+_LINE_CONTINUES_END = ("(", ",", "&&", "||", "+", "*", "/", ".", "=", "=>", "?", ":", "[")
+_LINE_CONTINUES_START = (".", "&&", "||", "?", ":", "+", "*", "/")
+
+
+# Languages with """ multi-line strings: Java text blocks, Kotlin/Scala/Groovy/Dart/
+# Swift multi-line strings, C# 11 raw string literals (3+ quotes).
+_TRIPLE_DQ_LANGS = {"java", "kotlin", "scala", "groovy", "dart", "swift", "cs"}
+_TRIPLE_SQ_LANGS = {"groovy", "dart"}
+# ...of which these process backslash escapes inside the triple-quoted string
+_TRIPLE_ESCAPE_LANGS = {"java", "groovy", "dart", "swift"}
+# Backtick strings: JS template literals (escapes apply), Go raw strings (no escapes)
+_BACKTICK_ESCAPE_LANGS = {"js", "vue", "svelte"}
+_BACKTICK_RAW_LANGS = {"go"}
+# Languages where ordinary "..." / '...' strings may span several lines
+_MULTILINE_STRING_LANGS = {"php"}
 
 
 def _clean_cstyle_code(content: str, lang: str) -> str:
     """Strip comments and string literals from a C-style code string.
 
-    Preserves all line breaks and replaces stripped content with spaces
-    so that line numbers and positions align perfectly.
-    """
-    chars = list(content)
-    length = len(chars)
-    i = 0
-    cleaned = []
-    state = "NORMAL"
+    Every stripped character becomes a space and every newline is kept, so the
+    result has exactly the same lines (and columns) as the input. Callers rely
+    on that: they index the cleaned lines with the raw line numbers.
 
-    while i < length:
-        c = chars[i]
-        next_c = chars[i+1] if i + 1 < length else ""
+    Interpolation holes are code and are kept: JS `${...}` in template literals
+    and C# `{...}` in $"...", $@"..." and single-$ raw (triple-quote) strings.
+    """
+    out = []
+    n = len(content)
+    i = 0
+    state = "NORMAL"   # NORMAL | LINE_COMMENT | BLOCK_COMMENT | STRING | VERBATIM
+    delim = ""         # closing delimiter of the current STRING
+    escapes = True     # whether backslash escapes apply in the current STRING
+    interp = None      # None | "js" (${...}) | "cs" ({...}) for the current string
+    # Open interpolation holes: [depth of ordinary { } inside the hole, string
+    # context (state, delim, escapes, interp) to return to when the hole closes]
+    holes = []
+
+    def blank(ch):
+        return "\n" if ch == "\n" else " "
+
+    while i < n:
+        c = content[i]
 
         if state == "NORMAL":
-            if c == "/" and next_c == "/":
+            two = content[i:i + 2]
+            if two == "//":
                 state = "LINE_COMMENT"
-                cleaned.append(" ")
-                cleaned.append(" ")
+                out.append("  ")
                 i += 2
-                continue
-            elif c == "/" and next_c == "*":
+            elif two == "/*":
                 state = "BLOCK_COMMENT"
-                cleaned.append(" ")
-                cleaned.append(" ")
+                out.append("  ")
                 i += 2
-                continue
             elif lang == "php" and c == "#":
                 state = "LINE_COMMENT"
-                cleaned.append(" ")
+                out.append(" ")
                 i += 1
-                continue
-            elif c == "'":
-                state = "STRING_SINGLE"
-                cleaned.append(" ")
+            elif lang == "cs" and c in "$@" and re.match(r'\$*@\$*"|\$+"', content[i:i + 8]):
+                # C# string prefixes: $"..." (interpolated), @"..." / $@"..." (verbatim),
+                # $"""...""" (raw). $$""" raw strings use {{...}} holes: not tracked.
+                m = re.match(r'(\$*@?\$*)"', content[i:i + 8])
+                prefix = m.group(1)
+                dollars = prefix.count("$")
+                k = len(prefix)
+                out.append(" " * k)
+                i += k
+                interp = "cs" if dollars == 1 else None
+                if "@" in prefix:
+                    state = "VERBATIM"
+                    out.append(" ")
+                    i += 1
+                else:
+                    q = 1
+                    while i + q < n and content[i + q] == '"':
+                        q += 1
+                    q = q if q >= 3 else 1
+                    state = "STRING"
+                    delim = '"' * q
+                    escapes = q == 1
+                    out.append(" " * q)
+                    i += q
+            elif c in ('"', "'"):
+                triple_ok = ((c == '"' and lang in _TRIPLE_DQ_LANGS) or
+                             (c == "'" and lang in _TRIPLE_SQ_LANGS))
+                if triple_ok and content.startswith(c * 3, i):
+                    k = 3
+                    if lang == "cs":  # raw string literals may use 4+ quotes
+                        while i + k < n and content[i + k] == '"':
+                            k += 1
+                    delim = c * k
+                    escapes = lang in _TRIPLE_ESCAPE_LANGS
+                else:
+                    k = 1
+                    delim = c
+                    escapes = True
+                interp = None
+                state = "STRING"
+                out.append(" " * k)
+                i += k
+            elif c == "`" and lang in (_BACKTICK_ESCAPE_LANGS | _BACKTICK_RAW_LANGS):
+                state = "STRING"
+                delim = "`"
+                escapes = lang in _BACKTICK_ESCAPE_LANGS
+                interp = "js" if escapes else None
+                out.append(" ")
                 i += 1
-                continue
-            elif c == '"':
-                state = "STRING_DOUBLE"
-                cleaned.append(" ")
+            elif holes and c == "}" and holes[-1][0] == 0:
+                # End of an interpolation hole: back inside its string
+                state, delim, escapes, interp = holes.pop()[1]
+                out.append(" ")
                 i += 1
-                continue
-            elif lang in ("js", "ts", "jsx", "tsx") and c == "`":
-                state = "STRING_BACKTICK"
-                cleaned.append(" ")
-                i += 1
-                continue
             else:
-                cleaned.append(c)
+                if holes and c == "{":
+                    holes[-1][0] += 1
+                elif holes and c == "}":
+                    holes[-1][0] -= 1
+                out.append(c)
                 i += 1
-                continue
 
         elif state == "LINE_COMMENT":
             if c == "\n":
                 state = "NORMAL"
-                cleaned.append("\n")
-            else:
-                cleaned.append(" ")
+            out.append(blank(c))
             i += 1
-            continue
 
         elif state == "BLOCK_COMMENT":
-            if c == "*" and next_c == "/":
+            if content.startswith("*/", i):
                 state = "NORMAL"
-                cleaned.append(" ")
-                cleaned.append(" ")
+                out.append("  ")
                 i += 2
-            elif c == "\n":
-                cleaned.append("\n")
-                i += 1
             else:
-                cleaned.append(" ")
+                out.append(blank(c))
                 i += 1
-            continue
 
-        elif state == "STRING_SINGLE":
-            if c == "\\":
-                cleaned.append(" ")
-                cleaned.append(" ")
-                i += 2
-            elif c == "'":
-                state = "NORMAL"
-                cleaned.append(" ")
-                i += 1
-            elif c == "\n":
-                cleaned.append("\n")
-                i += 1
-            else:
-                cleaned.append(" ")
-                i += 1
-            continue
+        elif interp == "cs" and content.startswith(("{{", "}}"), i):
+            out.append("  ")      # escaped brace inside a C# interpolated string
+            i += 2
 
-        elif state == "STRING_DOUBLE":
-            if c == "\\":
-                cleaned.append(" ")
-                cleaned.append(" ")
+        elif interp == "cs" and c == "{":
+            holes.append([0, (state, delim, escapes, interp)])
+            state = "NORMAL"
+            out.append(" ")
+            i += 1
+
+        elif state == "VERBATIM":
+            if content.startswith('""', i):
+                out.append("  ")
                 i += 2
             elif c == '"':
                 state = "NORMAL"
-                cleaned.append(" ")
-                i += 1
-            elif c == "\n":
-                cleaned.append("\n")
+                out.append(" ")
                 i += 1
             else:
-                cleaned.append(" ")
+                out.append(blank(c))
                 i += 1
-            continue
 
-        elif state == "STRING_BACKTICK":
-            if c == "\\":
-                cleaned.append(" ")
-                cleaned.append(" ")
+        else:  # STRING
+            if escapes and c == "\\":
+                # Escape sequence. The escaped char may be a newline (line
+                # continuation, e.g. in Java text blocks) and must be kept.
+                out.append(" ")
+                if i + 1 < n:
+                    out.append(blank(content[i + 1]))
                 i += 2
-            elif c == "`":
+            elif interp == "js" and content.startswith("${", i):
+                holes.append([0, (state, delim, escapes, interp)])
                 state = "NORMAL"
-                cleaned.append(" ")
-                i += 1
-            elif c == "\n":
-                cleaned.append("\n")
+                out.append("  ")
+                i += 2
+            elif content.startswith(delim, i):
+                state = "NORMAL"
+                out.append(" " * len(delim))
+                i += len(delim)
+            elif c == "\n" and len(delim) == 1 and delim != "`" and lang not in _MULTILINE_STRING_LANGS:
+                # An ordinary string cannot span lines; treat the quote as stray
+                # (e.g. a Rust lifetime  'a) so it cannot swallow later lines.
+                state = "NORMAL"
+                out.append("\n")
                 i += 1
             else:
-                cleaned.append(" ")
+                out.append(blank(c))
                 i += 1
-            continue
 
-    return "".join(cleaned)
+    return "".join(out)
+
+
+# JS/TS function assigned to a name:  export const total = (a, b) => ...
+_RE_JS_ASSIGNED_FUNC = re.compile(r"^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*(?::[^=]*)?=\s*(?:async\s+)?(?:function\b|\()")
+_RE_OPERATOR_NAME = re.compile(r"\boperator\s*([^\s(]+(?:\s+[^\s(]+)?)\s*\(")
+
+
+def _extract_func_name(stripped: str, lang: str = "") -> tuple:
+    """Return (name, previous_word) for a function-declaration line.
+
+    The name is the identifier immediately before the first '(' (generic
+    parameters such as name<T>( are skipped). The previous word is the word
+    before the (possibly qualified) name, e.g. 'return' in  return Task.WhenAll(.
+    '?' when no name is found.
+    """
+    if lang == "objc":
+        m = _FUNC_OBJC_METHOD.match(stripped)
+        if m:
+            return m.group(1), ""
+    if lang == "cs":
+        m = _RE_OPERATOR_NAME.search(stripped)
+        if m:
+            return "operator" + m.group(1).replace(" ", ""), ""
+    if lang in ("js", "vue", "svelte"):
+        m = _RE_JS_ASSIGNED_FUNC.match(stripped)
+        if m:
+            return m.group(1), ""
+    paren_idx = stripped.find("(")
+    if paren_idx <= 0:
+        return "?", ""
+    end = paren_idx - 1
+    while end >= 0 and stripped[end] == " ":
+        end -= 1
+    # Handle generic methods: name<T>(  → find name before '<'
+    if end >= 0 and stripped[end] == ">":
+        depth_g = 1
+        end -= 1
+        while end >= 0 and depth_g > 0:
+            if stripped[end] == ">":
+                depth_g += 1
+            elif stripped[end] == "<":
+                depth_g -= 1
+            end -= 1
+        while end >= 0 and stripped[end] == " ":
+            end -= 1
+    word_end = end + 1
+    while end >= 0 and (stripped[end].isalnum() or stripped[end] == "_"):
+        end -= 1
+    name = stripped[end + 1:word_end] or "?"
+    # Skip a qualifier (Task.WhenAll, IDisposable.Dispose, this.Foo)
+    while end >= 0 and (stripped[end].isalnum() or stripped[end] in "_."):
+        end -= 1
+    # Previous word (e.g. 'new' in  new Foo() {)
+    while end >= 0 and stripped[end] == " ":
+        end -= 1
+    prev_end = end + 1
+    while end >= 0 and (stripped[end].isalnum() or stripped[end] == "_"):
+        end -= 1
+    return name, stripped[end + 1:prev_end]
+
+
+def _match_function_decl(clean_stripped: str, lang: str):
+    """If a cleaned, stripped line declares a function/method, return the text
+    from where the declaration starts (so `a(); } catch (e) {` is judged by
+    `catch (e) {`, not by `a(`); otherwise None."""
+    func_pat = _FUNC_PATTERNS.get(lang)
+    if not func_pat:
+        return None
+    line = _RE_LEADING_ATTRS.sub("", clean_stripped) if lang != "objc" else clean_stripped
+    m = func_pat.search(line)
+    if not m:
+        return None
+    if lang in _SEMICOLON_NOT_DECL_LANGS and line.endswith(";"):
+        return None
+    decl = line[m.start():]
+    if lang == "cs":
+        # Expression-bodied member (`Foo() => expr`): no block body
+        arrow, brace = decl.find("=>"), decl.find("{")
+        if arrow >= 0 and (brace < 0 or arrow < brace):
+            return None
+    name, prev = _extract_func_name(decl, lang)
+    if not prev:  # declaration starts mid-line: previous word is before the match
+        before = line[:m.start()].split()
+        prev = before[-1] if before else ""
+    if name in _CONTROL_KEYWORDS:
+        return None
+    # Statements such as  return foo(a,  /  new Foo() {  /  throw bar(
+    if prev in _NOT_DECL_PREV_WORDS and name != "function":
+        return None
+    return decl
+
+
+def _is_function_decl(clean_stripped: str, lang: str) -> bool:
+    """True if a cleaned, stripped line declares a function/method."""
+    return _match_function_decl(clean_stripped, lang) is not None
+
+
+def _match_accessor(clean_stripped: str, lang: str):
+    """C# accessor with a block body (get/set/init/add/remove): its keyword, else None."""
+    if lang != "cs":
+        return None
+    m = _CS_ACCESSOR.match(_RE_LEADING_ATTRS.sub("", clean_stripped))
+    return m.group(1) if m else None
+
+
+def _brace_kind(header: str, lang: str, cog_struct_pats, cog_hybrid_pats) -> str:
+    """Role of a `{` from the code before it: 'ctrl' (if/else/loop/switch/catch...),
+    'switchexpr' (C# switch expression), 'func' (function, lambda, accessor body)
+    or 'other' (class, namespace, try, using, initializer...)."""
+    h = header.strip()
+    if lang == "cs" and _RE_CS_SWITCH_EXPR.search(h):
+        return "switchexpr"
+    if _RE_CASE_HEADER.match(h):
+        return "other"
+    probe = h + " {"
+    if (_RE_NESTING_HEADER_EXTRA.search(h)
+            or any(p.search(probe) for p in cog_struct_pats)
+            or any(p.search(probe) for p in cog_hybrid_pats)):
+        return "ctrl"
+    arrow = _LAMBDA_ARROW.get(lang)
+    if (arrow and arrow in h) or _RE_FUNC_KEYWORD_HEADER.search(h):
+        return "func"
+    if _match_accessor(h, lang) or _is_function_decl(h, lang):
+        return "func"
+    return "other"
 
 
 def _analyze_cstyle(content: str, fm: FileMetrics) -> FileMetrics:
     """Analyze a C-style (brace-delimited) language file.
 
-    Works for: JS/TS, C#, Java, C, C++, Go, Rust, Kotlin, PHP, Swift, Dart, Scala.
+    Works for: JS/TS, C#, Java, C, C++, Go, Rust, Kotlin, PHP, Swift, Dart, Scala,
+    Objective-C, Groovy, and the extracted <script> of Vue/Svelte files.
 
     Cognitive Complexity is calculated per the SonarSource 2023 specification:
       - Structural:    +1 + nesting_level  (if, for, while, switch, catch, ternary)
       - Hybrid:        +1 only             (else, else if) — increases nesting
       - Fundamental:   +1 per sequence     (logical operator sequences)
       - Ignored:       try, finally, synchronized, ??, ?.
+    Nesting comes from braces whose role is control flow, and from lambdas /
+    local functions inside a function (see _brace_kind).
     """
     cc_pats, cog_struct_pats, cog_hybrid_pats = _patterns_for(fm.lang)
+    lang = fm.lang
+    arrow = _LAMBDA_ARROW.get(lang)
     lines = content.split("\n")
     fm.total_lines = len(lines)
 
     # Pre-process the content to strip out strings and comments for complexity and nesting analysis
-    cleaned_content = _clean_cstyle_code(content, fm.lang)
+    cleaned_content = _clean_cstyle_code(content, lang)
     clean_lines = cleaned_content.split("\n")
 
     in_block_comment = False
-    nesting_stack = []
-    cognitive_nesting = 0
+    # Open braces: [kind, nests (bool), paren depth at the brace]
+    stack = []
+    cognitive_nesting = 0     # number of entries in `stack` that nest
+    paren_depth = 0
+    # Expression lambdas  x => expr  still open: [paren depth, brace depth]
+    inline_lambdas = []
+    pending = []              # code since the last brace / ';' (header of an Allman '{')
+    # Brace-less bodies:  for (...)  /  if (...) foo();  /  else  on its own line
+    awaiting = None           # None | "ctrl" | "else": a header ended the previous line
+    virtual = []              # brace depth where each brace-less body started (nests +1)
+    logic_prev = None         # last && / || of an expression continuing over lines
+    ternaries_in_stmt = 0     # ternaries so far in the current (multi-line) expression
+    prev_cs = ""
 
-    # Determine function detection pattern for this language
-    _FUNC_PATTERNS = {
-        "cs": _FUNC_CS, "js": _FUNC_JS, "java": _FUNC_JAVA,
-        "c": _FUNC_C, "cpp": _FUNC_C, "go": _FUNC_GO, "rust": _FUNC_RUST,
-        "kotlin": _FUNC_KOTLIN, "php": _FUNC_PHP, "swift": _FUNC_SWIFT,
-        "dart": _FUNC_DART, "scala": _FUNC_SCALA,
-    }
-    func_pat = _FUNC_PATTERNS.get(fm.lang)
+    def in_function():
+        return any(e[0] == "func" for e in stack)
+
+    def next_code_line(idx):
+        for k in range(idx + 1, len(clean_lines)):
+            t = clean_lines[k].strip()
+            if t:
+                return t
+        return ""
 
     for i, line in enumerate(lines):
         stripped = line.strip()
@@ -918,79 +1267,173 @@ def _analyze_cstyle(content: str, fm: FileMetrics) -> FileMetrics:
             continue
 
         # C# XML doc comments: /// ...
-        if fm.lang == "cs" and stripped.startswith("///"):
+        if lang == "cs" and stripped.startswith("///"):
             fm.comment_lines += 1
             continue
 
         # Java/Kotlin/Scala Javadoc comments
-        if fm.lang in ("java", "kotlin", "scala") and stripped.startswith("/**"):
+        if lang in ("java", "kotlin", "scala") and stripped.startswith("/**"):
             fm.comment_lines += 1
             if "*/" not in stripped:
                 in_block_comment = True
             continue
 
         # Rust doc comments: /// or //!
-        if fm.lang == "rust" and (stripped.startswith("///") or stripped.startswith("//!")):
+        if lang == "rust" and (stripped.startswith("///") or stripped.startswith("//!")):
             fm.comment_lines += 1
             continue
 
         # PHP also supports # comments
-        if fm.lang == "php" and stripped.startswith("#"):
+        if lang == "php" and stripped.startswith("#"):
             fm.comment_lines += 1
             continue
 
         fm.code_lines += 1
 
+        # C# preprocessor directives (#if, #region, ...) are not code paths
+        if lang == "cs" and stripped.startswith("#"):
+            continue
+
         # ── Complexity & Nesting Analysis (uses cleaned source to ignore strings/comments) ──
-        clean_line = clean_lines[i]
-        clean_stripped = clean_line.strip()
+        cs = clean_lines[i].strip()
+        if not cs:
+            continue
 
         # ── Function/method detection ──
-        if func_pat and func_pat.search(clean_stripped):
+        if _is_function_decl(cs, lang) or _match_accessor(cs, lang):
             fm.functions += 1
 
         # ── Cyclomatic complexity ──
         for pattern in cc_pats:
-            fm.cyclomatic += len(pattern.findall(clean_stripped))
+            fm.cyclomatic += len(pattern.findall(cs))
 
-        # ── Determine if this line has non-nesting braces ──
-        is_non_nesting_brace = bool(
-            _RE_TRY.search(clean_stripped) or
-            _RE_FINALLY.search(clean_stripped) or
-            _RE_NAMESPACE.search(clean_stripped) or
-            _RE_CLASS_LIKE.search(clean_stripped)
-        )
-
-        # ── Process closing braces BEFORE scoring ──
-        closes = clean_stripped.count("}")
-        for _ in range(closes):
-            if nesting_stack:
-                was_nesting = nesting_stack.pop()
-                if was_nesting:
-                    cognitive_nesting = max(0, cognitive_nesting - 1)
-
-        # ── Cognitive complexity (SonarSource 2023 spec) ──
-        for pattern in cog_struct_pats:
-            matches = pattern.findall(clean_stripped)
-            for _ in matches:
-                fm.cognitive += 1 + cognitive_nesting
-
-        for pattern in cog_hybrid_pats:
-            fm.cognitive += len(pattern.findall(clean_stripped))
-
-        fm.cognitive += _count_logical_operator_sequences(clean_stripped)
-
-        # ── Process opening braces AFTER scoring ──
-        opens = clean_stripped.count("{")
-        for _ in range(opens):
-            if is_non_nesting_brace:
-                nesting_stack.append(False)
-                is_non_nesting_brace = False
+        # ── A header without braces on the previous line: is this line its body? ──
+        skip_else_if = False
+        if awaiting:
+            if cs.startswith("{"):
+                pass                                   # the header's own block
+            elif awaiting == "else" and re.match(r"if\b", cs):
+                skip_else_if = True                    # else <newline> if  ==  else if
             else:
-                nesting_stack.append(True)
-                cognitive_nesting += 1
+                virtual.append(len(stack))
+            awaiting = None
 
-        fm.max_nesting = max(fm.max_nesting, len(nesting_stack))
+        # ── Events in source order: braces, parens, arrows, structural/hybrid keywords ──
+        events = [(m.start(), m.group(0)) for m in _RE_TOKENS.finditer(cs)]
+        for pattern in cog_struct_pats:
+            events += [(m.start(), "S") for m in pattern.finditer(cs)]
+        for pattern in cog_hybrid_pats:
+            events += [(m.start(), "H") for m in pattern.finditer(cs)]
+        events.sort(key=lambda e: e[0])
+
+        is_case_line = bool(_RE_CASE_HEADER.match(cs))
+        seg_start = 0          # start of the code segment before the next brace
+        depth_at_start = len(stack)
+        # A multi-line ternary continues when a line starts or ends with ? / :
+        if not (cs.startswith(("?", ":")) or prev_cs.endswith(("?", ":"))):
+            ternaries_in_stmt = 0
+        # A logical-operator sequence continues when && / || ends or starts a line
+        if not (prev_cs.endswith(("&&", "||")) or cs.startswith(("&&", "||"))):
+            logic_prev = None
+        for pos, ev in events:
+            if ev == "S":
+                if skip_else_if and pos == 0:
+                    skip_else_if = False                # counted by the `else` (+1)
+                    continue
+                bonus = len(inline_lambdas) + len(virtual)
+                if cs[pos] == "?":
+                    bonus += ternaries_in_stmt   # nested/chained  a ? x : b ? y : z
+                    ternaries_in_stmt += 1
+                fm.cognitive += 1 + cognitive_nesting + bonus
+            elif ev == "H":
+                fm.cognitive += 1
+            elif ev == "(":
+                paren_depth += 1
+            elif ev == ")":
+                paren_depth = max(0, paren_depth - 1)
+                inline_lambdas = [l for l in inline_lambdas if l[0] <= paren_depth]
+            elif ev in (",", ";"):
+                inline_lambdas = [l for l in inline_lambdas
+                                  if not (l[0] == paren_depth and l[1] == len(stack))]
+            elif ev in ("=>", "->"):
+                if stack and stack[-1][0] == "switchexpr" and ev == "=>" and paren_depth == stack[-1][2]:
+                    # C# switch-expression arm (a discard `_ =>` / `_ when .. =>`
+                    # is the default arm; its guard is counted as `when`)
+                    arm = cs[:pos] if cs[:pos].strip() else (pending[-1] if pending else "")
+                    if not re.search(r"(?:^|[,{])\s*_\s*(?:when\b.*)?$", arm):
+                        fm.cyclomatic += 1
+                    if not cs[:pos].strip() and re.search(r"(?<!\.)\bwhen\b(?!\s*[(:,)=])", arm):
+                        fm.cyclomatic += 1   # guard on the line above:  A when cond <newline> => ...
+                elif (ev == arrow and not is_case_line and in_function()
+                        and not cs[pos + 2:].lstrip().startswith("{")
+                        and (pos + 2 < len(cs))):
+                    # Expression lambda inside a function: nests what follows it
+                    inline_lambdas.append([paren_depth, len(stack)])
+            elif ev == "{":
+                header = cs[seg_start:pos].strip()
+                if header:
+                    kind = _brace_kind(header, lang, cog_struct_pats, cog_hybrid_pats)
+                else:
+                    # Brace on its own line: the header is the closest preceding
+                    # line(s) that classify (multi-line signatures / conditions)
+                    kind = "other"
+                    for k in range(1, len(pending) + 1):
+                        header = " ".join(pending[-k:])
+                        kind = _brace_kind(header, lang, cog_struct_pats, cog_hybrid_pats)
+                        if kind != "other":
+                            break
+                if kind == "func" and arrow and arrow in header and inline_lambdas:
+                    # `x =>` then `{` (next line), or `x => new Foo {`: one lambda level
+                    inline_lambdas.pop()
+                nests = kind in ("ctrl", "switchexpr") or (kind == "func" and in_function())
+                stack.append([kind, nests, paren_depth])
+                if nests:
+                    cognitive_nesting += 1
+                fm.max_nesting = max(fm.max_nesting, len(stack))
+                seg_start = pos + 1
+                pending = []
+            elif ev == "}":
+                if stack:
+                    if stack.pop()[1]:
+                        cognitive_nesting -= 1
+                inline_lambdas = [l for l in inline_lambdas if l[1] <= len(stack)]
+                seg_start = pos + 1
+                pending = []
+
+        # ── Logical operator sequences (a sequence may continue from the previous line) ──
+        ops = _logical_ops(cs)
+        if ops:
+            fm.cognitive += _count_logical_operator_sequences(cs, logic_prev)
+            logic_prev = ops[-1][1]
+
+        # A lambda inside an open call  .Select(x =>  continues until its ')';
+        # one ending the line (`x =>`) continues on the next line; any other
+        # lambda not closed by ')', ',', ';' or '}' ends with the line.
+        if not (arrow and cs.endswith(arrow)):
+            inline_lambdas = [l for l in inline_lambdas if l[0] > 0]
+
+        tail = cs[seg_start:].strip()
+        if len(stack) == depth_at_start and not cs.startswith("}"):
+            tail = cs             # braces opened and closed on this line:  if (o is { A: 1 })
+        if cs.endswith(";") or (cs.endswith(":") and not cs.endswith("::")):
+            pending = []          # end of statement, or a label such as  case X:
+        elif tail:
+            pending = (pending + [tail])[-4:]
+
+        # ── Does this line end with a control header whose body is on the next line? ──
+        if not cs.endswith((";", "{", "}")) and (cs.endswith(")") or re.search(r"\b(?:else|do)$", cs)):
+            for k in range(1, len(pending) + 1):
+                header = " ".join(pending[-k:])
+                if _RE_BRACELESS_HEADER.match(header) and header.count("(") == header.count(")"):
+                    awaiting = "else" if re.search(r"\belse$", cs) else "ctrl"
+                    break
+        # A brace-less body ends with its line unless the statement continues
+        # (or a block opened in it is still open, or another header follows).
+        if virtual and not awaiting:
+            nxt = next_code_line(i)
+            if not (cs.endswith(_LINE_CONTINUES_END) or nxt.startswith(_LINE_CONTINUES_START)):
+                virtual = [v for v in virtual if v < len(stack)]
+        prev_cs = cs
 
     return fm
 
@@ -1008,8 +1451,7 @@ def _analyze_indentation_based(content: str, fm: FileMetrics) -> FileMetrics:
     base_indent = None
 
     # Determine function detection pattern
-    _FUNC_PATTERNS = {"py": _FUNC_PYTHON, "ruby": _FUNC_RUBY, "r": _FUNC_R}
-    func_pat = _FUNC_PATTERNS.get(fm.lang)
+    func_pat = {"py": _FUNC_PYTHON, "ruby": _FUNC_RUBY, "r": _FUNC_R}.get(fm.lang)
 
     for line in lines:
         stripped = line.strip()
@@ -1174,8 +1616,7 @@ def _analyze_html(content: str, fm: FileMetrics) -> FileMetrics:
 
 # ─── Function boundary detection ──────────────────────────────────────────
 
-# Regex to extract function/method name (word before opening paren)
-_FUNC_NAME_RE = re.compile(r'(\w+)\s*[\(<]')
+# Identifiers reported as '?' rather than as a function name
 _FUNC_NAME_KEYWORDS = {
     'if', 'else', 'while', 'for', 'foreach', 'switch', 'catch',
     'lock', 'using', 'return', 'new', 'throw', 'typeof', 'sizeof',
@@ -1185,103 +1626,119 @@ _FUNC_NAME_KEYWORDS = {
 }
 
 
+_JS_LANGS = {"js", "vue", "svelte"}
+
+
+def _next_code(lines: list, j: int) -> str:
+    for k in range(j + 1, len(lines)):
+        t = lines[k].strip()
+        if t:
+            return t
+    return ""
+
+
+def _find_statement_end(lines: list, i: int, col: int):
+    """End line of the expression starting at line i / column col (the body of a
+    JS arrow function `(x) => expr`): where brackets balance and the statement
+    does not continue on the next line."""
+    depth = 0
+    for j in range(i, len(lines)):
+        text = lines[j][col:] if j == i else lines[j]
+        for ch in text:
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+                if depth < 0:          # the arrow was an argument:  f(x => x + 1)
+                    return j
+        t = lines[j].rstrip()
+        if depth == 0 and t and (t.endswith(";") or not (
+                t.endswith(_LINE_CONTINUES_END) or _next_code(lines, j).startswith(_LINE_CONTINUES_START))):
+            return j
+    return len(lines) - 1
+
+
+def _find_block_end(lines: list, i: int, col: int, lang: str):
+    """From line i / column col, find the function's `{` and its matching `}`.
+
+    Returns the 0-based end line, or None when the declaration has no block body:
+    a ';' (prototype, abstract member) or, in C#, '=>' (expression-bodied member)
+    comes before the first '{'. A JS arrow function with an expression body
+    (`const f = (x) => x * 2;`) ends where its statement ends.
+    """
+    depth = 0
+    found_open = False
+    for j in range(i, len(lines)):
+        text = lines[j][col:] if j == i else lines[j]
+        k = 0
+        while k < len(text):
+            ch = text[k]
+            if not found_open and lang in _JS_LANGS and text.startswith("=>", k):
+                rest = text[k + 2:].strip() or _next_code(lines, j)
+                if not rest.startswith("{"):
+                    return _find_statement_end(lines, j, (col if j == i else 0) + k + 2)
+                k += 2
+                continue
+            if not found_open and (ch == ";" or (lang == "cs" and text.startswith("=>", k))):
+                return None
+            if ch == "{":
+                depth += 1
+                found_open = True
+            elif ch == "}":
+                depth -= 1
+                if found_open and depth == 0:
+                    return j
+            k += 1
+    return None
+
+
 def _find_function_boundaries(content: str, lang: str) -> list:
-    """Find function/method start and end lines. Returns [(name, start_0idx, end_0idx), ...]."""
-    _FUNC_PATS = {
-        'cs': _FUNC_CS, 'js': _FUNC_JS, 'java': _FUNC_JAVA,
-        'c': _FUNC_C, 'cpp': _FUNC_C, 'go': _FUNC_GO, 'rust': _FUNC_RUST,
-        'kotlin': _FUNC_KOTLIN, 'php': _FUNC_PHP, 'swift': _FUNC_SWIFT,
-        'dart': _FUNC_DART, 'scala': _FUNC_SCALA,
-    }
-    func_pat = _FUNC_PATS.get(lang)
-    if not func_pat:
+    """Find function/method start and end lines. Returns [(name, start_0idx, end_0idx), ...].
+
+    Works on the cleaned source, so braces and keywords inside comments and
+    string literals do not affect detection or brace matching. In C#, accessors
+    with a block body are reported as  Property.get / Property.set.
+    Nested functions (local functions, lambdas) are part of their enclosing one.
+    """
+    if lang not in _FUNC_PATTERNS:
         return []
 
-    lines = content.split('\n')
+    lines = _clean_cstyle_code(content, lang).split('\n')
     functions = []
-    in_block_comment = False
+    last_property = "?"   # C#: name of the property whose accessors follow
     i = 0
 
     while i < len(lines):
         stripped = lines[i].strip()
 
-        # Skip block comments
-        if in_block_comment:
-            if '*/' in stripped:
-                in_block_comment = False
+        decl = _match_function_decl(stripped, lang)
+        accessor = None if decl is not None else _match_accessor(stripped, lang)
+        if decl is None and accessor is None:
+            if lang == "cs":
+                m = _CS_PROPERTY.match(_RE_LEADING_ATTRS.sub("", stripped))
+                if m:
+                    last_property = "this[]" if m.group(1).startswith("this") else m.group(1)
             i += 1
             continue
 
-        if stripped.startswith('//') or stripped.startswith('///'):
+        if decl is not None:
+            func_name, _ = _extract_func_name(decl, lang)
+            assigned = _RE_JS_ASSIGNED_FUNC.match(stripped) if lang in _JS_LANGS else None
+            if assigned:                       # let h = function (a) { ... }
+                func_name = assigned.group(1)
+            if func_name in _FUNC_NAME_KEYWORDS:
+                func_name = '?'
+            col = lines[i].find(decl)
+        else:
+            func_name = f"{last_property}.{accessor}"
+            col = lines[i].find(accessor)
+
+        end = _find_block_end(lines, i, max(col, 0), lang)
+        if end is None:
             i += 1
             continue
-
-        if stripped.startswith('/*') or stripped.startswith('/**'):
-            if '*/' not in stripped:
-                in_block_comment = True
-            i += 1
-            continue
-
-        # Skip attributes / annotations
-        if stripped.startswith('[') and not stripped.startswith('[Key'):
-            i += 1
-            continue
-
-        # Check for function declaration
-        if func_pat.search(stripped):
-            # Extract the function name: the word immediately before the
-            # first '(' on the line — that's the method/function name.
-            paren_idx = stripped.find('(')
-            func_name = '?'
-            if paren_idx > 0:
-                # Walk backwards from '(' to find the identifier
-                end = paren_idx - 1
-                while end >= 0 and stripped[end] == ' ':
-                    end -= 1
-                # Handle generic methods: name<T>(  → find name before '<'
-                if end >= 0 and stripped[end] == '>':
-                    # Skip over generic params: find matching '<'
-                    depth_g = 1
-                    end -= 1
-                    while end >= 0 and depth_g > 0:
-                        if stripped[end] == '>': depth_g += 1
-                        elif stripped[end] == '<': depth_g -= 1
-                        end -= 1
-                # Now extract the identifier
-                word_end = end + 1
-                while end >= 0 and (stripped[end].isalnum() or stripped[end] == '_'):
-                    end -= 1
-                func_name = stripped[end + 1:word_end]
-                if not func_name or func_name in _FUNC_NAME_KEYWORDS:
-                    func_name = '?'
-
-            func_start = i
-
-            # Find the opening brace and its matching closing brace
-            depth = 0
-            found_open = False
-            j = i
-            matched = False
-            while j < len(lines):
-                for ch in lines[j]:
-                    if ch == '{':
-                        depth += 1
-                        found_open = True
-                    elif ch == '}':
-                        depth -= 1
-                        if found_open and depth == 0:
-                            functions.append((func_name, func_start, j))
-                            i = j + 1
-                            matched = True
-                            break
-                if matched:
-                    break
-                j += 1
-
-            if matched:
-                continue
-
-        i += 1
+        functions.append((func_name, i, end))
+        i = end + 1
 
     return functions
 
@@ -1315,13 +1772,60 @@ def _analyze_functions(content: str, rel_path: str, lang: str) -> list:
     return result
 
 
-def analyze_file(filepath: str, rel_path: str) -> FileMetrics:
-    """Compute complexity metrics for a single file (any supported language)."""
-    ext = os.path.splitext(filepath)[1].lstrip(".").lower()
-    lang = _get_lang(ext)
+_SFC_SCRIPT_RE = re.compile(r"<script\b[^>]*>(.*?)</script\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def _extract_sfc_script(content: str) -> str:
+    """Keep only the <script> block contents of a Vue/Svelte single-file component.
+
+    Everything outside <script> blocks (template, style, custom blocks) is
+    reduced to its newlines, so line numbers in the result match the original
+    file. Handles several blocks (e.g. <script> + <script setup>); a block with
+    src="..." and no inline code contributes nothing.
+    """
+    parts = []
+    pos = 0
+    for m in _SFC_SCRIPT_RE.finditer(content):
+        parts.append("\n" * content.count("\n", pos, m.start(1)))
+        parts.append(m.group(1))
+        pos = m.end(1)
+    parts.append("\n" * content.count("\n", pos))
+    return "".join(parts)
+
+
+_OBJC_MARKERS = re.compile(r"^\s*(?:#import\b|#include\b|@implementation\b|@interface\b|@end\b)", re.MULTILINE)
+
+
+def _looks_like_objc(content: str) -> bool:
+    """.m is shared by Objective-C and MATLAB; only Objective-C has these markers."""
+    return bool(_OBJC_MARKERS.search(content))
+
+
+def _detect_lang(filepath: str) -> str:
+    """Language key for a path: exact filename first (Jenkinsfile), then extension."""
+    fname = os.path.basename(filepath)
+    if fname in FILENAME_LANGS:
+        return FILENAME_LANGS[fname]
+    return _get_lang(os.path.splitext(fname)[1].lstrip("."))
+
+
+def analyze_file(filepath: str, rel_path: str):
+    """Compute complexity metrics for a single file (any supported language).
+
+    Returns None for a file that should not be analyzed (a MATLAB .m file).
+    """
+    lang = _detect_lang(filepath)
 
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
+
+    if lang == "objc" and filepath.lower().endswith(".m") and not _looks_like_objc(content):
+        return None
+
+    if lang in SFC_LANGS:
+        # Only <script> is analyzed; template/style lines end up as blank lines,
+        # so code_lines counts script code only and total_lines the whole file.
+        content = _extract_sfc_script(content)
 
     fm = FileMetrics(rel_path, lang)
 
@@ -1387,6 +1891,9 @@ def _should_exclude(rel_path: str, fname: str, excludes: list) -> bool:
     return False
 
 
+_EXTENSIONS_LOWER = {e.lower() for e in EXTENSIONS}
+
+
 def scan_project(root_dir: str, excludes: list = None) -> list:
     """Walk the directory tree and analyze all matching files."""
     all_metrics = []
@@ -1397,7 +1904,7 @@ def scan_project(root_dir: str, excludes: list = None) -> list:
 
         for fname in filenames:
             ext = os.path.splitext(fname)[1]
-            if ext.lower() not in {e.lower() for e in EXTENSIONS}:
+            if ext.lower() not in _EXTENSIONS_LOWER and fname not in FILENAME_LANGS:
                 continue
             if any(fname.endswith(s) for s in SKIP_SUFFIXES):
                 continue
@@ -1410,7 +1917,8 @@ def scan_project(root_dir: str, excludes: list = None) -> list:
 
             try:
                 fm = analyze_file(fpath, rel)
-                all_metrics.append(fm)
+                if fm is not None:
+                    all_metrics.append(fm)
             except Exception as e:
                 print(f"  ⚠ Error reading {rel}: {e}", file=sys.stderr)
 
@@ -1439,7 +1947,9 @@ def categorize(metrics: list) -> dict:
             cats["types"].append(m)
         elif any(p.endswith(s) for s in (
             "config.ts", "config.tsx", "config.js", "config.mjs",
+            "config.mts", "config.cts",
             "config.cs", "startup.cs", "program.cs",
+            ".gradle", "jenkinsfile",
         )) or "setup" in p:
             cats["config"].append(m)
         elif "/components/ui/" in p or "/ui/" in p:
@@ -1576,6 +2086,7 @@ def print_summary(metrics: list, top_n: int = 10, verbose: bool = False):
         "c": "C", "cpp": "C++", "go": "Go", "rust": "Rust",
         "kotlin": "Kotlin", "php": "PHP", "swift": "Swift", "ruby": "Ruby",
         "r": "R", "dart": "Dart", "scala": "Scala", "py": "Python",
+        "vue": "Vue", "svelte": "Svelte", "objc": "Objective-C", "groovy": "Groovy",
     }
     langs = {}
     for m in metrics:
@@ -2000,7 +2511,7 @@ Examples:
         print(f"  Scanning: {root}")
         if args.exclude:
             print(f"  Excluding: {', '.join(args.exclude)}")
-        print(f"  Extensions: {', '.join(sorted(EXTENSIONS))}")
+        print(f"  Extensions: {', '.join(sorted(EXTENSIONS))} (+ {', '.join(sorted(FILENAME_LANGS))})")
         print()
         print_summary(metrics, top_n=args.top, verbose=args.verbose)
 

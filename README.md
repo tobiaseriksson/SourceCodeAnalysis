@@ -56,11 +56,14 @@ Files are selected by extension. The script analyzes:
 
 | Language | Typical extensions |
 |----------|-------------------|
-| JavaScript / TypeScript | `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs` |
+| JavaScript / TypeScript | `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs`, `.mts`, `.cts` |
+| Vue / Svelte (`<script>` blocks only) | `.vue`, `.svelte` |
 | C# | `.cs` |
 | Java | `.java` |
 | C | `.c`, `.h` |
 | C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx` |
+| Objective-C | `.m`, `.mm` (a `.m` file is skipped unless it looks like Objective-C, since MATLAB uses `.m` too) |
+| Groovy / Gradle / Jenkins | `.groovy`, `.gradle`, `Jenkinsfile` |
 | Go | `.go` |
 | Rust | `.rs` |
 | Kotlin | `.kt`, `.kts` |
@@ -72,6 +75,47 @@ Files are selected by extension. The script analyzes:
 | Scala | `.scala`, `.sc` |
 | Python | `.py` |
 | HTML / Razor (markup in templates) | `.html`, `.htm`, `.cshtml`, `.razor` |
+
+For **Vue and Svelte** single-file components only the `<script>` blocks (including `<script setup>`) are analyzed, as JS/TS. The `<template>` and `<style>` sections are ignored, the same as SonarQube does, so a component's scores are comparable to a `.ts` file's. `code_lines` counts script lines only; `total_lines` is the whole file. Line numbers in function details refer to the original file.
+
+Comments and string literals are stripped before complexity is measured, including multi-line forms: Java text blocks and Kotlin/Scala/Groovy/Dart/Swift `"""` strings, C# verbatim (`@"..."`) and raw (`"""..."""`) strings, Go raw strings, and JS template literals. Interpolation holes still count as code: `${...}` in JS template literals and `{...}` in C# `$"..."` strings.
+
+### How the metrics are counted
+
+**Cyclomatic** = 1 + one per `if` / `else if`, `while`, `do … while`, `for`, `foreach`, `case` label, `catch`, `&&`, `||` and ternary `?:`. Plus, per language:
+
+- **C#:** `??`, `when` (exception filters, `case … when` guards and switch-arm guards), and each non-discard arm of a `switch` expression (like a `case` label).
+- **JS/TS and Dart:** `??`.
+- **Go, Rust and Swift:** conditions are written without parentheses (`if x > 0 {`). Rust also counts each `match` arm (`=>`).
+
+A ternary is a `?` with whitespace on both sides, so nullable types (`string? x`), TypeScript optional members (`name?: string`), `?.`, `??`, Kotlin's `?:` and Java wildcards (`<?>`) are not counted, while ternaries that span lines are.
+
+**Cognitive** follows the [SonarSource white paper](Cognitive_Complexity_Sonar_Guide_2023.pdf). `if`, loops, `switch` (also C# `switch` expressions), `catch` and `?:` add +1 plus the current nesting level. `else` and `else if` add +1. Each sequence of like logical operators adds +1, including a sequence that continues over several lines.
+
+Nesting comes only from control-flow blocks (`if`/`else`/loops/`switch`/`catch`) and from lambdas or local functions inside a function. The function's own body, classes, namespaces, `try`/`finally`, `using`/`lock`, object initializers and property accessors do not add nesting. This works for braces on the same line, braces on their own line (C# style), and brace-less bodies (`for (…)` followed by `if (…)` on the next line).
+
+**Functions:** for C#, methods (also without an access modifier, generic `Name<T>()`, explicit interface implementations), constructors, destructors, operators, and property/indexer/event accessors with a body (reported as `Count.get`). Expression-bodied members (`=> expr;`) and abstract or interface members have no block body and are not listed, although their complexity still counts for the file. For JS/TS, expression-bodied arrow functions (`const f = (x) => expr;`) are listed and named after their variable.
+
+**Known limits:** the analyzer works line by line, not on a full parse tree. C# `#if` blocks are always counted, because the analyzer can't know which preprocessor symbols are defined.
+
+### Checked against the C# compiler (Roslyn)
+
+[`tools/roslyn_check/`](tools/roslyn_check/) computes the same metrics with Roslyn, the C# compiler's own parser, and compares them with this script. It needs the **.NET 10 SDK** and fetches `Microsoft.CodeAnalysis.CSharp` from NuGet on first run.
+
+```bash
+dotnet run tools/roslyn_check/Oracle.cs -- /path/to/csharp/repo > oracle.json
+python3 tools/roslyn_check/compare.py oracle.json /path/to/csharp/repo
+```
+
+Results on three real C# code bases (about 3,900 files and 14,000 methods):
+
+| | Methods with a body detected | Same cyclomatic per method | Same cognitive per method | Same cyclomatic per file |
+|---|---|---|---|---|
+| Code base A (278 files) | 955 / 955 | 100% | 99.4% | 100% |
+| Code base B (528 files) | 681 / 686 | 100% | 100% | 100% |
+| Code base C (3,123 files) | 12,338 / 12,383 | 99.97% | 99.8% | 99.9% (`#if` blocks) |
+
+The test file [`test_fixtures/csharp/OrderService.cs`](test_fixtures/csharp/OrderService.cs) covers the tricky C# constructs, and its Roslyn-computed expected values are checked by the unit tests. Regenerate them with [`tools/roslyn_check/make_expected.py`](tools/roslyn_check/make_expected.py).
 
 The analyzer automatically skips typical noise paths (for example `node_modules`, `.git`, `dist`, `build`, `vendor`) and common generated files (for example `*.min.js`, `*.d.ts`, `*.Designer.cs`).
 
@@ -132,12 +176,15 @@ Logging patterns are applied per language. The script scans **source** files wit
 
 | Language | Typical extensions |
 |----------|-------------------|
-| JavaScript / TypeScript | `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs` |
+| JavaScript / TypeScript | `.js`, `.jsx`, `.ts`, `.tsx`, `.mjs`, `.cjs`, `.mts`, `.cts` |
+| Vue / Svelte (`<script>` blocks only) | `.vue`, `.svelte` |
 | C# | `.cs` |
 | Java | `.java` |
 | Python | `.py` |
 | C | `.c`, `.h` |
 | C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hxx` |
+| Objective-C | `.m`, `.mm` (a `.m` file is skipped unless it looks like Objective-C, since MATLAB uses `.m` too) |
+| Groovy / Gradle / Jenkins | `.groovy`, `.gradle`, `Jenkinsfile` |
 | Go | `.go` |
 | Rust | `.rs` |
 | Kotlin | `.kt`, `.kts` |

@@ -32,7 +32,8 @@ Supported languages and patterns:
     - System.out.println(...)       → level: info
     - System.err.println(...)       → level: error
 
-  JavaScript/TypeScript (.js, .ts, .tsx, .jsx, .mjs, .cjs):
+  JavaScript/TypeScript (.js, .ts, .tsx, .jsx, .mjs, .cjs, .mts, .cts),
+  and the <script> blocks of Vue/Svelte (.vue, .svelte):
     - console.log(...)              → level: info
     - console.warn(...)             → level: warn
     - console.error(...)            → level: error
@@ -129,6 +130,18 @@ Supported languages and patterns:
     - logger.info/debug/warn/error (SLF4J)
     - System.out/err
 
+  Objective-C (.m, .mm; a .m file that does not look like Objective-C is skipped):
+    - NSLog(...)                    → level: info
+    - os_log / os_log_error / os_log_debug
+    - DDLogError/Warn/Info/Debug/Verbose (CocoaLumberjack)
+    - C printf family (as for C)
+
+  Groovy / Gradle / Jenkins (.groovy, .gradle, Jenkinsfile):
+    - Java patterns (SLF4J, System.out/err)
+    - println ...                   → level: info
+    - echo ...                      → level: info     (Jenkins pipeline step)
+    - logger.lifecycle/quiet(...)   → level: info     (Gradle)
+
 How to run:
   From the project root, execute one of the following commands:
 
@@ -195,12 +208,15 @@ from pathlib import Path
 # ─── Configuration ──────────────────────────────────────────────────────────
 
 EXTENSIONS = {
-    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts",
+    ".vue", ".svelte",          # only the <script> blocks are scanned
     ".cs",
     ".java",
     ".py",
     ".c", ".h",
     ".cpp", ".cc", ".cxx", ".hpp", ".hxx",
+    ".m", ".mm",                # Objective-C (.m only if it is not MATLAB)
+    ".groovy", ".gradle",
     ".go",
     ".rs",
     ".kt", ".kts",
@@ -211,6 +227,9 @@ EXTENSIONS = {
     ".dart",
     ".scala", ".sc",
 }
+
+# Extensionless files recognised by exact name
+FILENAME_LANGS = {"Jenkinsfile": "groovy"}
 
 SKIP_DIRS = {
     "node_modules", ".git", "dist", "build", ".next", ".nuxt",
@@ -225,7 +244,12 @@ SKIP_DIRS = {
 SKIP_SUFFIXES = {".d.ts", ".min.js", ".bundle.js", ".Designer.cs", ".g.cs", ".g.i.cs"}
 
 # Language families
-LANG_JS = {"js", "jsx", "ts", "tsx", "mjs", "cjs"}
+LANG_JS = {"js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"}
+LANG_VUE = {"vue"}
+LANG_SVELTE = {"svelte"}
+LANG_OBJC = {"m", "mm"}
+LANG_GROOVY = {"groovy", "gradle"}
+SFC_LANGS = {"vue", "svelte"}
 LANG_CSHARP = {"cs"}
 LANG_JAVA = {"java"}
 LANG_PYTHON = {"py"}
@@ -274,6 +298,14 @@ def _get_lang(ext: str) -> str:
         return "dart"
     if ext in LANG_SCALA:
         return "scala"
+    if ext in LANG_VUE:
+        return "vue"
+    if ext in LANG_SVELTE:
+        return "svelte"
+    if ext in LANG_OBJC:
+        return "objc"
+    if ext in LANG_GROOVY:
+        return "groovy"
     return "unknown"
 
 
@@ -633,6 +665,31 @@ _LOG_SCALA = [
 ]
 
 
+# ── Objective-C patterns ───────────────────────────────────────────────────
+
+_LOG_OBJC = [
+    (re.compile(r'\bNSLog\s*\('), 'info', 'NSLog'),
+    (re.compile(r'\bos_log_error\s*\('), 'error', 'os_log'),
+    (re.compile(r'\bos_log_debug\s*\('), 'debug', 'os_log'),
+    (re.compile(r'\bos_log(?:_info)?\s*\('), 'info', 'os_log'),
+    # CocoaLumberjack
+    (re.compile(r'\bDDLogError\s*\('), 'error', 'CocoaLumberjack'),
+    (re.compile(r'\bDDLogWarn\s*\('), 'warn', 'CocoaLumberjack'),
+    (re.compile(r'\bDDLogInfo\s*\('), 'info', 'CocoaLumberjack'),
+    (re.compile(r'\bDDLogDebug\s*\('), 'debug', 'CocoaLumberjack'),
+    (re.compile(r'\bDDLogVerbose\s*\('), 'trace', 'CocoaLumberjack'),
+] + _LOG_C
+
+# ── Groovy / Gradle / Jenkinsfile patterns ─────────────────────────────────
+
+_LOG_GROOVY = _LOG_JAVA + [
+    (re.compile(r'^\s*println\b'), 'info', 'println'),
+    (re.compile(r'^\s*echo\b'), 'info', 'echo'),          # Jenkins pipeline step
+    (re.compile(r'\blogger\.lifecycle\s*\('), 'info', 'Gradle logger'),
+    (re.compile(r'\blogger\.quiet\s*\('), 'info', 'Gradle logger'),
+]
+
+
 def _patterns_for(lang: str):
     """Return the list of (regex, level, category) for a language."""
     return {
@@ -651,6 +708,10 @@ def _patterns_for(lang: str):
         "r": _LOG_R,
         "dart": _LOG_DART,
         "scala": _LOG_SCALA,
+        "vue": _LOG_JS,
+        "svelte": _LOG_JS,
+        "objc": _LOG_OBJC,
+        "groovy": _LOG_GROOVY,
     }.get(lang, [])
 
 
@@ -690,7 +751,8 @@ class FileLogMetrics:
 
 # Languages using C-style comments (// and /* */)
 _CSTYLE_COMMENT_LANGS = {"cs", "java", "js", "c", "cpp", "go", "rust", "kotlin",
-                          "swift", "dart", "scala", "php"}
+                          "swift", "dart", "scala", "php",
+                          "vue", "svelte", "objc", "groovy"}
 # Languages using # comments
 _HASH_COMMENT_LANGS = {"py", "ruby", "r"}
 
@@ -702,10 +764,41 @@ _HASH_LINE_COMMENT = re.compile(r'^\s*#')
 
 # ─── Analyzer ──────────────────────────────────────────────────────────────
 
-def analyze_file(filepath: str, rel_path: str) -> FileLogMetrics:
-    """Analyze a single file for logging statements."""
-    ext = os.path.splitext(filepath)[1].lstrip(".").lower()
-    lang = _get_lang(ext)
+_SFC_SCRIPT_RE = re.compile(r"<script\b[^>]*>(.*?)</script\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def _extract_sfc_script(content: str) -> str:
+    """Keep only the <script> block contents of a Vue/Svelte single-file component.
+
+    Everything else is reduced to its newlines, so line numbers still match.
+    """
+    parts = []
+    pos = 0
+    for m in _SFC_SCRIPT_RE.finditer(content):
+        parts.append("\n" * content.count("\n", pos, m.start(1)))
+        parts.append(m.group(1))
+        pos = m.end(1)
+    parts.append("\n" * content.count("\n", pos))
+    return "".join(parts)
+
+
+_OBJC_MARKERS = re.compile(r"^\s*(?:#import\b|#include\b|@implementation\b|@interface\b|@end\b)", re.MULTILINE)
+
+
+def _detect_lang(filepath: str) -> str:
+    """Language key for a path: exact filename first (Jenkinsfile), then extension."""
+    fname = os.path.basename(filepath)
+    if fname in FILENAME_LANGS:
+        return FILENAME_LANGS[fname]
+    return _get_lang(os.path.splitext(fname)[1].lstrip("."))
+
+
+def analyze_file(filepath: str, rel_path: str):
+    """Analyze a single file for logging statements.
+
+    Returns None for a file that should not be analyzed (a MATLAB .m file).
+    """
+    lang = _detect_lang(filepath)
     patterns = _patterns_for(lang)
 
     fm = FileLogMetrics(rel_path, lang)
@@ -715,6 +808,12 @@ def analyze_file(filepath: str, rel_path: str) -> FileLogMetrics:
 
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         content = f.read()
+
+    if lang == "objc" and filepath.lower().endswith(".m") and not _OBJC_MARKERS.search(content):
+        return None
+
+    if lang in SFC_LANGS:
+        content = _extract_sfc_script(content)
 
     lines = content.split("\n")
     in_block_comment = False
@@ -826,6 +925,9 @@ def _should_exclude(rel_path: str, fname: str, excludes: list) -> bool:
 
 # ─── Project scanning ──────────────────────────────────────────────────────
 
+_EXTENSIONS_LOWER = {e.lower() for e in EXTENSIONS}
+
+
 def scan_project(root_dir: str, excludes: list = None) -> list:
     """Walk the directory tree and analyze all matching files."""
     all_metrics = []
@@ -836,7 +938,7 @@ def scan_project(root_dir: str, excludes: list = None) -> list:
 
         for fname in filenames:
             ext = os.path.splitext(fname)[1]
-            if ext.lower() not in {e.lower() for e in EXTENSIONS}:
+            if ext.lower() not in _EXTENSIONS_LOWER and fname not in FILENAME_LANGS:
                 continue
             if any(fname.endswith(s) for s in SKIP_SUFFIXES):
                 continue
@@ -849,7 +951,8 @@ def scan_project(root_dir: str, excludes: list = None) -> list:
 
             try:
                 fm = analyze_file(fpath, rel)
-                all_metrics.append(fm)
+                if fm is not None:
+                    all_metrics.append(fm)
             except Exception as e:
                 print(f"  ⚠ Error reading {rel}: {e}", file=sys.stderr)
 
@@ -863,6 +966,7 @@ _LANG_LABELS = {
     "c": "C", "cpp": "C++", "go": "Go", "rust": "Rust",
     "kotlin": "Kotlin", "php": "PHP", "swift": "Swift", "ruby": "Ruby",
     "r": "R", "dart": "Dart", "scala": "Scala",
+    "vue": "Vue", "svelte": "Svelte", "objc": "Objective-C", "groovy": "Groovy",
 }
 
 
@@ -910,6 +1014,7 @@ def print_summary(metrics: list, top_n: int = 10, verbose: bool = False):
         lang_stats[label]["code"] += m.code_lines
         lang_stats[label]["active"] += m.active_log_lines
         lang_stats[label]["commented"] += m.commented_log_lines
+
 
     sep = "=" * 62
     print(sep)
